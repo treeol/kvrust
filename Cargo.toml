@@ -1,0 +1,27 @@
+[package]
+name = "kvr"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight, sharded, concurrent in-memory key-value store with a Unix Domain Socket server for IPC"
+license = "Apache-2.0"
+repository = "https://github.com/treeol/kvrust"
+homepage = "https://github.com/treeol/kvrust"
+readme = "README.md"
+keywords = ["kv", "cache", "in-memory", "concurrent", "ipc"]
+categories = ["database-implementations", "caching"]
+
+[dependencies]
+parking_lot = "0.12"
+signal-hook = "0.3"
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[[bin]]
+name = "bench_wire"
+path = "src/bin/bench_wire.rs"
