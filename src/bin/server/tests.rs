@@ -2,6 +2,7 @@
 //! tests, and UDS integration tests.
 
 use crate::*;
+use kvr::protocol::*;
 use std::io::Write;
 use std::net::TcpStream;
 use std::time::Duration;
@@ -208,35 +209,35 @@ mod protocol_tests {
     #[test]
     fn dispatch_empty_frame() {
         let store = ShardedKV::new();
-        assert_eq!(dispatch(&[], &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&[], &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
     fn dispatch_unknown_opcode() {
         let store = ShardedKV::new();
-        assert_eq!(dispatch(&[0x99], &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&[0x99], &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
     fn dispatch_set_ok() {
         let store = ShardedKV::new();
         let frame = make_set("hello", b"world");
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_OK]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_OK]);
         assert_eq!(store.get("hello"), Some(b"world".to_vec()));
     }
 
     #[test]
     fn dispatch_set_store_full() {
         let store = ShardedKV::with_max_entries(1);
-        assert_eq!(dispatch(&make_set("a", b"1"), &store, &None), vec![RESP_OK]);
+        assert_eq!(dispatch(&make_set("a", b"1"), &store, None), vec![RESP_OK]);
         // Store is full — new key gets STORE_FULL response.
         assert_eq!(
-            dispatch(&make_set("b", b"2"), &store, &None),
+            dispatch(&make_set("b", b"2"), &store, None),
             vec![RESP_STORE_FULL]
         );
         // Overwriting existing key still works.
         assert_eq!(
-            dispatch(&make_set("a", b"updated"), &store, &None),
+            dispatch(&make_set("a", b"updated"), &store, None),
             vec![RESP_OK]
         );
     }
@@ -244,8 +245,8 @@ mod protocol_tests {
     #[test]
     fn dispatch_set_overwrite() {
         let store = ShardedKV::new();
-        dispatch(&make_set("k", b"v1"), &store, &None);
-        dispatch(&make_set("k", b"v2"), &store, &None);
+        dispatch(&make_set("k", b"v1"), &store, None);
+        dispatch(&make_set("k", b"v2"), &store, None);
         assert_eq!(store.get("k"), Some(b"v2".to_vec()));
     }
 
@@ -253,7 +254,7 @@ mod protocol_tests {
     fn dispatch_set_empty_value() {
         let store = ShardedKV::new();
         let frame = make_set("empty", &[]);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_OK]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_OK]);
         assert_eq!(store.get("empty"), Some(vec![]));
     }
 
@@ -262,20 +263,20 @@ mod protocol_tests {
         let store = ShardedKV::new();
         let mut frame = make_set("k", b"v");
         frame.push(0xDE);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
     fn dispatch_set_short_key_len() {
         let store = ShardedKV::new();
-        assert_eq!(dispatch(&[OP_SET, 0x01], &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&[OP_SET, 0x01], &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
     fn dispatch_get_found() {
         let store = ShardedKV::new();
         store.set("key", b"val".to_vec());
-        let resp = dispatch(&make_get("key"), &store, &None);
+        let resp = dispatch(&make_get("key"), &store, None);
         assert_eq!(resp[0], RESP_OK);
         let val_len = u32::from_be_bytes([resp[1], resp[2], resp[3], resp[4]]) as usize;
         assert_eq!(val_len, 3);
@@ -285,7 +286,7 @@ mod protocol_tests {
     #[test]
     fn dispatch_get_not_found() {
         let store = ShardedKV::new();
-        let resp = dispatch(&make_get("missing"), &store, &None);
+        let resp = dispatch(&make_get("missing"), &store, None);
         assert_eq!(resp, vec![RESP_NOT_FOUND]);
     }
 
@@ -293,8 +294,8 @@ mod protocol_tests {
     fn dispatch_get_empty_value_distinguished_from_missing() {
         let store = ShardedKV::new();
         store.set("empty", vec![]);
-        let resp_found = dispatch(&make_get("empty"), &store, &None);
-        let resp_missing = dispatch(&make_get("nope"), &store, &None);
+        let resp_found = dispatch(&make_get("empty"), &store, None);
+        let resp_missing = dispatch(&make_get("nope"), &store, None);
         assert_eq!(resp_found[0], RESP_OK);
         assert!(resp_found.len() >= 5);
         assert_eq!(resp_missing, vec![RESP_NOT_FOUND]);
@@ -306,7 +307,7 @@ mod protocol_tests {
         let store = ShardedKV::new();
         let big: Vec<u8> = (0..70_000).map(|i| (i % 256) as u8).collect();
         store.set("big", big.clone());
-        let resp = dispatch(&make_get("big"), &store, &None);
+        let resp = dispatch(&make_get("big"), &store, None);
         assert_eq!(resp[0], RESP_OK);
         let val_len = u32::from_be_bytes([resp[1], resp[2], resp[3], resp[4]]) as usize;
         assert_eq!(val_len, 70_000);
@@ -317,7 +318,7 @@ mod protocol_tests {
     fn dispatch_del_found() {
         let store = ShardedKV::new();
         store.set("k", b"v".to_vec());
-        assert_eq!(dispatch(&make_del("k"), &store, &None), vec![RESP_DELETED]);
+        assert_eq!(dispatch(&make_del("k"), &store, None), vec![RESP_DELETED]);
         assert_eq!(store.get("k"), None);
     }
 
@@ -325,7 +326,7 @@ mod protocol_tests {
     fn dispatch_del_not_found() {
         let store = ShardedKV::new();
         assert_eq!(
-            dispatch(&make_del("nope"), &store, &None),
+            dispatch(&make_del("nope"), &store, None),
             vec![RESP_NOT_FOUND]
         );
     }
@@ -336,7 +337,7 @@ mod protocol_tests {
         let mut frame = vec![OP_GET];
         frame.extend_from_slice(&[0, 3]);
         frame.extend_from_slice(&[0xFF, 0xFE, 0xFD]);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
@@ -346,7 +347,7 @@ mod protocol_tests {
         frame.extend_from_slice(&[0, 3]);
         frame.extend_from_slice(&[0xFF, 0xFE, 0xFD]);
         frame.extend_from_slice(&[0, 0, 0, 0]);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
@@ -355,7 +356,7 @@ mod protocol_tests {
         store.set("k", b"v".to_vec());
         let mut frame = make_get("k");
         frame.push(0xDE);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
@@ -364,7 +365,7 @@ mod protocol_tests {
         store.set("k", b"v".to_vec());
         let mut frame = make_del("k");
         frame.push(0xDE);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_ERROR]);
         assert_eq!(store.get("k"), Some(b"v".to_vec()));
     }
 
@@ -373,10 +374,10 @@ mod protocol_tests {
         let store = ShardedKV::new();
         for i in 0..10 {
             let frame = make_set(&format!("k{i}"), format!("v{i}").as_bytes());
-            assert_eq!(dispatch(&frame, &store, &None), vec![RESP_OK]);
+            assert_eq!(dispatch(&frame, &store, None), vec![RESP_OK]);
         }
         for i in 0..10 {
-            let resp = dispatch(&make_get(&format!("k{i}")), &store, &None);
+            let resp = dispatch(&make_get(&format!("k{i}")), &store, None);
             assert_eq!(resp[0], RESP_OK);
             let val_len = u32::from_be_bytes([resp[1], resp[2], resp[3], resp[4]]) as usize;
             assert_eq!(val_len, 2);
@@ -384,18 +385,18 @@ mod protocol_tests {
         }
         for i in (0..10).step_by(2) {
             assert_eq!(
-                dispatch(&make_del(&format!("k{i}")), &store, &None),
+                dispatch(&make_del(&format!("k{i}")), &store, None),
                 vec![RESP_DELETED]
             );
         }
         for i in (0..10).step_by(2) {
             assert_eq!(
-                dispatch(&make_get(&format!("k{i}")), &store, &None),
+                dispatch(&make_get(&format!("k{i}")), &store, None),
                 vec![RESP_NOT_FOUND]
             );
         }
         for i in (1..10).step_by(2) {
-            let resp = dispatch(&make_get(&format!("k{i}")), &store, &None);
+            let resp = dispatch(&make_get(&format!("k{i}")), &store, None);
             assert_eq!(resp[0], RESP_OK);
         }
     }
@@ -403,9 +404,9 @@ mod protocol_tests {
     #[test]
     fn dispatch_ping() {
         let store = ShardedKV::new();
-        assert_eq!(dispatch(&[OP_PING], &store, &None), vec![RESP_OK]);
+        assert_eq!(dispatch(&[OP_PING], &store, None), vec![RESP_OK]);
         // PING with trailing bytes should error.
-        assert_eq!(dispatch(&[OP_PING, 0x01], &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&[OP_PING, 0x01], &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
@@ -414,16 +415,16 @@ mod protocol_tests {
         store.set("key", b"val".to_vec());
 
         // EXISTS on present key → OK
-        assert_eq!(dispatch(&make_exists("key"), &store, &None), vec![RESP_OK]);
+        assert_eq!(dispatch(&make_exists("key"), &store, None), vec![RESP_OK]);
         // EXISTS on missing key → NOT_FOUND
         assert_eq!(
-            dispatch(&make_exists("missing"), &store, &None),
+            dispatch(&make_exists("missing"), &store, None),
             vec![RESP_NOT_FOUND]
         );
         // EXISTS with trailing bytes → ERROR
         let mut frame = make_exists("key");
         frame.push(0xDE);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
@@ -431,21 +432,21 @@ mod protocol_tests {
         let store = ShardedKV::new();
         // Empty key (key_len=0) — valid, should return NOT_FOUND.
         let frame = vec![OP_EXISTS, 0x00, 0x00];
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_NOT_FOUND]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_NOT_FOUND]);
 
         // Set empty key, then EXISTS should return OK.
         store.set("", b"v".to_vec());
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_OK]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_OK]);
 
         // Invalid UTF-8 key → ERROR
         let mut bad_frame = vec![OP_EXISTS];
         bad_frame.extend_from_slice(&[0, 3]);
         bad_frame.extend_from_slice(&[0xFF, 0xFE, 0xFD]);
-        assert_eq!(dispatch(&bad_frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&bad_frame, &store, None), vec![RESP_ERROR]);
 
         // Truncated key-len (claims 5 bytes, only 2 available) → ERROR
         assert_eq!(
-            dispatch(&[OP_EXISTS, 0x00, 0x05, b'a', b'b'], &store, &None),
+            dispatch(&[OP_EXISTS, 0x00, 0x05, b'a', b'b'], &store, None),
             vec![RESP_ERROR]
         );
     }
@@ -456,7 +457,7 @@ mod protocol_tests {
     fn dispatch_setx_ok() {
         let store = ShardedKV::new();
         let frame = make_setx("temp", b"ephemeral", 3_600_000);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_OK]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_OK]);
         assert_eq!(store.get("temp"), Some(b"ephemeral".to_vec()));
     }
 
@@ -464,7 +465,7 @@ mod protocol_tests {
     fn dispatch_setx_ttl_zero_rejected() {
         let store = ShardedKV::new();
         let frame = make_setx("temp", b"v", 0);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_ERROR]);
         // Key should not be stored.
         assert_eq!(store.get("temp"), None);
     }
@@ -473,17 +474,17 @@ mod protocol_tests {
     fn dispatch_setx_store_full() {
         let store = ShardedKV::with_max_entries(1);
         assert_eq!(
-            dispatch(&make_setx("a", b"1", 3_600_000), &store, &None),
+            dispatch(&make_setx("a", b"1", 3_600_000), &store, None),
             vec![RESP_OK]
         );
         // Store is full — new key gets STORE_FULL.
         assert_eq!(
-            dispatch(&make_setx("b", b"2", 3_600_000), &store, &None),
+            dispatch(&make_setx("b", b"2", 3_600_000), &store, None),
             vec![RESP_STORE_FULL]
         );
         // Overwriting existing key still works.
         assert_eq!(
-            dispatch(&make_setx("a", b"updated", 3_600_000), &store, &None),
+            dispatch(&make_setx("a", b"updated", 3_600_000), &store, None),
             vec![RESP_OK]
         );
     }
@@ -493,7 +494,7 @@ mod protocol_tests {
         let store = ShardedKV::new();
         let mut frame = make_setx("k", b"v", 1000);
         frame.push(0xDE);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
@@ -502,7 +503,7 @@ mod protocol_tests {
         // Missing the 8-byte ttl-ms field.
         let mut frame = make_set("k", b"v");
         frame[0] = OP_SETX; // Change opcode to SETX but don't add TTL.
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
@@ -513,14 +514,14 @@ mod protocol_tests {
         frame.extend_from_slice(&[0xFF, 0xFE, 0xFD]);
         frame.extend_from_slice(&[0, 0, 0, 0]); // val_len=0
         frame.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x03, 0xE8]); // ttl=1000
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
     fn dispatch_setx_empty_value() {
         let store = ShardedKV::new();
         let frame = make_setx("empty", &[], 3_600_000);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_OK]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_OK]);
         assert_eq!(store.get("empty"), Some(vec![]));
     }
 
@@ -529,13 +530,13 @@ mod protocol_tests {
         let store = ShardedKV::new();
         // 50ms TTL.
         let frame = make_setx("temp", b"v", 50);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_OK]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_OK]);
         assert_eq!(store.len(), 1);
 
         std::thread::sleep(std::time::Duration::from_millis(80));
 
         // GET on expired → NOT_FOUND, entry removed, count decremented.
-        let resp = dispatch(&make_get("temp"), &store, &None);
+        let resp = dispatch(&make_get("temp"), &store, None);
         assert_eq!(resp, vec![RESP_NOT_FOUND]);
         assert_eq!(store.len(), 0);
     }
@@ -544,14 +545,14 @@ mod protocol_tests {
     fn dispatch_set_after_setx_clears_ttl() {
         let store = ShardedKV::new();
         // SETX with short TTL.
-        dispatch(&make_setx("k", b"v1", 50), &store, &None);
+        dispatch(&make_setx("k", b"v1", 50), &store, None);
         // Plain SET overwrites — entry becomes permanent.
-        dispatch(&make_set("k", b"v2"), &store, &None);
+        dispatch(&make_set("k", b"v2"), &store, None);
         assert_eq!(store.len(), 1);
 
         // Wait past original TTL — entry should still be present.
         std::thread::sleep(std::time::Duration::from_millis(80));
-        let resp = dispatch(&make_get("k"), &store, &None);
+        let resp = dispatch(&make_get("k"), &store, None);
         assert_eq!(resp[0], RESP_OK);
     }
 
@@ -565,7 +566,7 @@ mod protocol_tests {
         store.set("banana", b"3".to_vec());
 
         // Scan with prefix "app" — should return "app2" and "apple" sorted.
-        let resp = dispatch(&make_scan("app", 100, ""), &store, &None);
+        let resp = dispatch(&make_scan("app", 100, ""), &store, None);
         assert_eq!(resp[0], RESP_OK);
         let count = u16::from_be_bytes([resp[1], resp[2]]) as usize;
         assert_eq!(count, 2);
@@ -591,7 +592,7 @@ mod protocol_tests {
         store.set("c", b"3".to_vec());
 
         // Empty prefix = scan all.
-        let resp = dispatch(&make_scan("", 100, ""), &store, &None);
+        let resp = dispatch(&make_scan("", 100, ""), &store, None);
         assert_eq!(resp[0], RESP_OK);
         let count = u16::from_be_bytes([resp[1], resp[2]]) as usize;
         assert_eq!(count, 3);
@@ -606,7 +607,7 @@ mod protocol_tests {
         }
 
         // Page 1: limit=3, empty cursor.
-        let resp = dispatch(&make_scan("", 3, ""), &store, &None);
+        let resp = dispatch(&make_scan("", 3, ""), &store, None);
         assert_eq!(resp[0], RESP_OK);
         let count = u16::from_be_bytes([resp[1], resp[2]]) as usize;
         assert_eq!(count, 3);
@@ -623,7 +624,7 @@ mod protocol_tests {
         }
 
         // Page 2: limit=3, cursor=last key of page 1.
-        let resp = dispatch(&make_scan("", 3, &last_key), &store, &None);
+        let resp = dispatch(&make_scan("", 3, &last_key), &store, None);
         assert_eq!(resp[0], RESP_OK);
         let count = u16::from_be_bytes([resp[1], resp[2]]) as usize;
         assert_eq!(count, 3);
@@ -639,7 +640,7 @@ mod protocol_tests {
         }
 
         // Page 3: limit=3, cursor=last key of page 2.
-        let resp = dispatch(&make_scan("", 3, &last_key), &store, &None);
+        let resp = dispatch(&make_scan("", 3, &last_key), &store, None);
         assert_eq!(resp[0], RESP_OK);
         let count = u16::from_be_bytes([resp[1], resp[2]]) as usize;
         assert_eq!(count, 3);
@@ -655,7 +656,7 @@ mod protocol_tests {
         }
 
         // Page 4: limit=3, cursor=last key of page 3 — only 1 key left.
-        let resp = dispatch(&make_scan("", 3, &last_key), &store, &None);
+        let resp = dispatch(&make_scan("", 3, &last_key), &store, None);
         assert_eq!(resp[0], RESP_OK);
         let count = u16::from_be_bytes([resp[1], resp[2]]) as usize;
         assert_eq!(count, 1);
@@ -671,7 +672,7 @@ mod protocol_tests {
         // Wait for expiry.
         std::thread::sleep(std::time::Duration::from_millis(80));
 
-        let resp = dispatch(&make_scan("", 100, ""), &store, &None);
+        let resp = dispatch(&make_scan("", 100, ""), &store, None);
         assert_eq!(resp[0], RESP_OK);
         let count = u16::from_be_bytes([resp[1], resp[2]]) as usize;
         assert_eq!(count, 1); // only "perm"
@@ -688,7 +689,7 @@ mod protocol_tests {
         }
 
         // Request limit=2000, should cap at 1024 and return all 10.
-        let resp = dispatch(&make_scan("", 2000, ""), &store, &None);
+        let resp = dispatch(&make_scan("", 2000, ""), &store, None);
         assert_eq!(resp[0], RESP_OK);
         let count = u16::from_be_bytes([resp[1], resp[2]]) as usize;
         assert_eq!(count, 10);
@@ -703,7 +704,7 @@ mod protocol_tests {
         }
 
         // Request limit=2000, should cap at 1024 and return exactly 1024.
-        let resp = dispatch(&make_scan("", 2000, ""), &store, &None);
+        let resp = dispatch(&make_scan("", 2000, ""), &store, None);
         assert_eq!(resp[0], RESP_OK);
         let count = u16::from_be_bytes([resp[1], resp[2]]) as usize;
         assert_eq!(count, 1024);
@@ -716,13 +717,13 @@ mod protocol_tests {
         let store = ShardedKV::new();
         let mut frame = make_scan("", 10, "");
         frame.push(0xDE);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
     fn dispatch_scan_empty_store() {
         let store = ShardedKV::new();
-        let resp = dispatch(&make_scan("", 100, ""), &store, &None);
+        let resp = dispatch(&make_scan("", 100, ""), &store, None);
         assert_eq!(resp[0], RESP_OK);
         let count = u16::from_be_bytes([resp[1], resp[2]]) as usize;
         assert_eq!(count, 0);
@@ -737,7 +738,7 @@ mod protocol_tests {
         store.set("a", b"val_a".to_vec());
         store.set("c", b"val_c".to_vec());
 
-        let resp = dispatch(&make_mget(&["a", "b", "c"]), &store, &None);
+        let resp = dispatch(&make_mget(&["a", "b", "c"]), &store, None);
         assert_eq!(resp[0], RESP_OK);
 
         // Key "a" — found.
@@ -767,7 +768,7 @@ mod protocol_tests {
         store.set("z", b"3".to_vec());
 
         // Request in non-sorted order.
-        let resp = dispatch(&make_mget(&["z", "x", "y"]), &store, &None);
+        let resp = dispatch(&make_mget(&["z", "x", "y"]), &store, None);
         assert_eq!(resp[0], RESP_OK);
 
         let mut pos = 1;
@@ -795,7 +796,7 @@ mod protocol_tests {
     #[test]
     fn dispatch_mget_all_missing() {
         let store = ShardedKV::new();
-        let resp = dispatch(&make_mget(&["a", "b", "c"]), &store, &None);
+        let resp = dispatch(&make_mget(&["a", "b", "c"]), &store, None);
         assert_eq!(resp[0], RESP_OK);
         assert_eq!(resp[1], 0x00); // a not found
         assert_eq!(resp[2], 0x00); // b not found
@@ -805,7 +806,7 @@ mod protocol_tests {
     #[test]
     fn dispatch_mget_empty() {
         let store = ShardedKV::new();
-        let resp = dispatch(&make_mget(&[]), &store, &None);
+        let resp = dispatch(&make_mget(&[]), &store, None);
         assert_eq!(resp[0], RESP_OK);
         assert_eq!(resp.len(), 1); // just RESP_OK, no entries
     }
@@ -815,7 +816,7 @@ mod protocol_tests {
         let store = ShardedKV::new();
         // Build a request with 257 keys (cap is 256).
         let keys: Vec<&str> = (0..257).map(|_| "k").collect();
-        let resp = dispatch(&make_mget(&keys), &store, &None);
+        let resp = dispatch(&make_mget(&keys), &store, None);
         assert_eq!(resp, vec![RESP_ERROR]);
     }
 
@@ -824,7 +825,7 @@ mod protocol_tests {
         let store = ShardedKV::new();
         let mut frame = make_mget(&["a"]);
         frame.push(0xDE);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
@@ -835,7 +836,7 @@ mod protocol_tests {
 
         std::thread::sleep(std::time::Duration::from_millis(80));
 
-        let resp = dispatch(&make_mget(&["perm", "temp"]), &store, &None);
+        let resp = dispatch(&make_mget(&["perm", "temp"]), &store, None);
         assert_eq!(resp[0], RESP_OK);
 
         // "perm" — found.
@@ -854,7 +855,7 @@ mod protocol_tests {
     fn dispatch_ttl_permanent() {
         let store = ShardedKV::new();
         store.set("k", b"v".to_vec());
-        let resp = dispatch(&make_ttl("k"), &store, &None);
+        let resp = dispatch(&make_ttl("k"), &store, None);
         assert_eq!(resp[0], RESP_OK);
         assert_eq!(resp[1], 0x00); // permanent
         assert_eq!(resp.len(), 2); // no remaining-ms payload
@@ -864,7 +865,7 @@ mod protocol_tests {
     fn dispatch_ttl_with_expiry() {
         let store = ShardedKV::new();
         store.set_with_ttl("temp", b"v".to_vec(), 3_600_000);
-        let resp = dispatch(&make_ttl("temp"), &store, &None);
+        let resp = dispatch(&make_ttl("temp"), &store, None);
         assert_eq!(resp[0], RESP_OK);
         assert_eq!(resp[1], 0x01); // has TTL
         assert_eq!(resp.len(), 10); // 1 + 1 + 8
@@ -878,7 +879,7 @@ mod protocol_tests {
     #[test]
     fn dispatch_ttl_not_found() {
         let store = ShardedKV::new();
-        let resp = dispatch(&make_ttl("missing"), &store, &None);
+        let resp = dispatch(&make_ttl("missing"), &store, None);
         assert_eq!(resp, vec![RESP_NOT_FOUND]);
     }
 
@@ -891,7 +892,7 @@ mod protocol_tests {
         std::thread::sleep(std::time::Duration::from_millis(80));
 
         // TTL on expired → NOT_FOUND, entry removed, count decremented.
-        let resp = dispatch(&make_ttl("temp"), &store, &None);
+        let resp = dispatch(&make_ttl("temp"), &store, None);
         assert_eq!(resp, vec![RESP_NOT_FOUND]);
         assert_eq!(store.len(), 0);
     }
@@ -902,7 +903,7 @@ mod protocol_tests {
         store.set("k", b"v".to_vec());
         let mut frame = make_ttl("k");
         frame.push(0xDE);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
@@ -911,21 +912,21 @@ mod protocol_tests {
         let mut frame = vec![OP_TTL];
         frame.extend_from_slice(&[0, 3]);
         frame.extend_from_slice(&[0xFF, 0xFE, 0xFD]);
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
     fn dispatch_ttl_truncated() {
         let store = ShardedKV::new();
         // Only 1 byte after opcode (need at least 2 for key-len).
-        assert_eq!(dispatch(&[OP_TTL, 0x01], &store, &None), vec![RESP_ERROR]);
+        assert_eq!(dispatch(&[OP_TTL, 0x01], &store, None), vec![RESP_ERROR]);
     }
 
     #[test]
     fn dispatch_ttl_empty_key_not_found() {
         let store = ShardedKV::new();
         let frame = vec![OP_TTL, 0x00, 0x00];
-        assert_eq!(dispatch(&frame, &store, &None), vec![RESP_NOT_FOUND]);
+        assert_eq!(dispatch(&frame, &store, None), vec![RESP_NOT_FOUND]);
     }
 
     // ─── Card 2 new tests ──────────────────────────────────────────────
@@ -940,7 +941,7 @@ mod protocol_tests {
         store.set("big", big_val);
 
         let frame = make_get("big");
-        let resp = dispatch(&frame, &store, &None);
+        let resp = dispatch(&frame, &store, None);
         assert_eq!(resp, vec![RESP_ERROR]);
     }
 
@@ -952,7 +953,7 @@ mod protocol_tests {
         store.set("key", b"value".to_vec());
 
         let frame = make_get("key");
-        let resp = dispatch(&frame, &store, &None);
+        let resp = dispatch(&frame, &store, None);
         assert_eq!(resp[0], RESP_OK);
     }
 
@@ -965,7 +966,7 @@ mod protocol_tests {
         store.set("boundary", val);
 
         let frame = make_get("boundary");
-        let resp = dispatch(&frame, &store, &None);
+        let resp = dispatch(&frame, &store, None);
         assert_eq!(resp[0], RESP_OK);
         assert_eq!(resp.len(), MAX_FRAME_SIZE);
     }
@@ -979,7 +980,7 @@ mod protocol_tests {
         store.set("over", val);
 
         let frame = make_get("over");
-        let resp = dispatch(&frame, &store, &None);
+        let resp = dispatch(&frame, &store, None);
         assert_eq!(resp, vec![RESP_ERROR]);
     }
 
@@ -992,7 +993,7 @@ mod protocol_tests {
         store.set(&big_key, b"v".to_vec());
 
         let frame = make_scan("", 100, "");
-        let resp = dispatch(&frame, &store, &None);
+        let resp = dispatch(&frame, &store, None);
         assert_eq!(resp, vec![RESP_ERROR]);
     }
 }
@@ -1934,7 +1935,7 @@ mod snapshot_tests {
         let store = ShardedKV::new();
         store.set("a", b"1".to_vec());
         // No snapshot manager configured.
-        let resp = dispatch(&make_save(), &store, &None);
+        let resp = dispatch(&make_save(), &store, None);
         assert_eq!(resp, vec![RESP_ERROR]);
     }
 
@@ -1945,7 +1946,7 @@ mod snapshot_tests {
         store.set("a", b"1".to_vec());
 
         let mgr = Arc::new(SnapshotManager::new(std::path::PathBuf::from(&path)));
-        let resp = dispatch(&make_save(), &store, &Some(Arc::clone(&mgr)));
+        let resp = dispatch(&make_save(), &store, Some(&*mgr as &dyn SnapshotSaver));
         assert_eq!(resp, vec![RESP_OK]);
         assert!(path_exists(&path));
 
@@ -1964,7 +1965,7 @@ mod snapshot_tests {
 
         let mut frame = make_save();
         frame.push(0xDE);
-        let resp = dispatch(&frame, &store, &Some(mgr));
+        let resp = dispatch(&frame, &store, Some(&*mgr as &dyn SnapshotSaver));
         assert_eq!(resp, vec![RESP_ERROR]);
     }
 

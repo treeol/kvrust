@@ -44,6 +44,8 @@
 
 #![warn(clippy::all)]
 
+pub mod protocol;
+
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};

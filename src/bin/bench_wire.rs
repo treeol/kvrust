@@ -1,30 +1,11 @@
 use kvr::ShardedKV;
-use std::io::{Read, Write};
+use kvr::protocol::{dispatch, read_frame, write_frame, OP_SET, OP_GET, OP_PING, RESP_OK};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const OP_SET: u8 = 0;
-const OP_GET: u8 = 1;
-const OP_PING: u8 = 3;
-const RESP_OK: u8 = 0x10;
 const SOCKET_PATH: &str = "/tmp/kvr_bench.sock";
-
-fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
-    stream.write_all(&(payload.len() as u32).to_be_bytes())?;
-    stream.write_all(payload)?;
-    stream.flush()
-}
-
-fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut frame = vec![0u8; len];
-    stream.read_exact(&mut frame)?;
-    Ok(frame)
-}
 
 fn make_set(key: &str, val: &[u8]) -> Vec<u8> {
     let mut frame = vec![OP_SET];
@@ -86,97 +67,15 @@ fn main() {
                         let mut writer = BufWriter::new(s);
 
                         loop {
-                            let mut len_buf = [0u8; 4];
-                            if reader.read_exact(&mut len_buf).is_err() {
-                                break;
-                            }
-                            let len = u32::from_be_bytes(len_buf) as usize;
-                            let mut frame = vec![0u8; len];
-                            if reader.read_exact(&mut frame).is_err() {
-                                break;
-                            }
-
-                            // Dispatch
-                            let resp = if frame.is_empty() {
-                                vec![0xFF]
-                            } else {
-                                let opcode = frame[0];
-                                let rest = &frame[1..];
-                                match opcode {
-                                    OP_SET => {
-                                        if rest.len() < 6 {
-                                            vec![0xFF]
-                                        } else {
-                                            let key_len =
-                                                u16::from_be_bytes([rest[0], rest[1]]) as usize;
-                                            let val_start = 2 + key_len;
-                                            if rest.len() < val_start + 4 {
-                                                vec![0xFF]
-                                            } else {
-                                                let val_len = u32::from_be_bytes([
-                                                    rest[val_start],
-                                                    rest[val_start + 1],
-                                                    rest[val_start + 2],
-                                                    rest[val_start + 3],
-                                                ])
-                                                    as usize;
-                                                let val_end = val_start + 4 + val_len;
-                                                if rest.len() != val_end {
-                                                    vec![0xFF]
-                                                } else {
-                                                    let key = &rest[2..2 + key_len];
-                                                    let val = &rest[val_start + 4..val_end];
-                                                    store.set(
-                                                        std::str::from_utf8(key).unwrap_or(""),
-                                                        val.to_vec(),
-                                                    );
-                                                    vec![RESP_OK]
-                                                }
-                                            }
-                                        }
-                                    }
-                                    OP_GET => {
-                                        if rest.len() < 2 {
-                                            vec![0xFF]
-                                        } else {
-                                            let key_len =
-                                                u16::from_be_bytes([rest[0], rest[1]]) as usize;
-                                            if rest.len() != 2 + key_len {
-                                                vec![0xFF]
-                                            } else {
-                                                let key = &rest[2..2 + key_len];
-                                                match store
-                                                    .get(std::str::from_utf8(key).unwrap_or(""))
-                                                {
-                                                    Some(val) => {
-                                                        let mut resp =
-                                                            Vec::with_capacity(1 + 4 + val.len());
-                                                        resp.push(RESP_OK);
-                                                        resp.extend_from_slice(
-                                                            &(val.len() as u32).to_be_bytes(),
-                                                        );
-                                                        resp.extend_from_slice(&val);
-                                                        resp
-                                                    }
-                                                    None => vec![0x12],
-                                                }
-                                            }
-                                        }
-                                    }
-                                    OP_PING => {
-                                        if rest.is_empty() {
-                                            vec![RESP_OK]
-                                        } else {
-                                            vec![0xFF]
-                                        }
-                                    }
-                                    _ => vec![0xFF],
-                                }
+                            let frame = match read_frame(&mut reader) {
+                                Ok(f) => f,
+                                Err(_) => break,
                             };
 
-                            let _ = writer.write_all(&(resp.len() as u32).to_be_bytes());
-                            let _ = writer.write_all(&resp);
-                            let _ = writer.flush();
+                            // Dispatch using the shared protocol layer.
+                            let resp = dispatch(&frame, &store, None);
+
+                            let _ = write_frame(&mut writer, &resp);
                         }
                     });
                 }
