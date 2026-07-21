@@ -284,7 +284,9 @@ docker run -d \
 # docker run --rm -v kvr-socket:/run/kvr ... connect to /run/kvr/kvr.sock
 ```
 
-The container runs as a non-root user (`kvr`), with the socket directory at `/run/kvr/` (permissions `0700`). The socket file itself has permissions `0600`. A health check using PING over UDS runs every 30 seconds.
+The container runs as a non-root user (`kvr`), with the socket directory at `/run/kvr/` (permissions `0700`). The socket file itself has permissions `0600`. A health check using PING over UDS runs every 30 seconds via `kvr-server --ping`.
+
+> **Note:** The socket directory (`0700`) and socket file (`0600`) are owned by `kvr:kvr`. Other containers connecting via the shared volume must run as the same UID. The `kvr` user's UID is image-dependent — check it with `docker run --rm kvr id -u kvr`, then run the client container with that numeric UID (e.g., `--user <uid>:<uid>`). Alternatively, build a custom image or entrypoint that relaxes the permissions.
 
 ## Security model
 

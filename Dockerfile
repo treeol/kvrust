@@ -33,10 +33,12 @@ ENV KVR_MAX_CONNECTIONS=256
 # Expose the socket directory as a volume.
 VOLUME ["/run/kvr"]
 
-# Healthcheck: connect to the socket and send a PING.
-# The server responds with 0x10 (OK) for a successful PING.
+# Healthcheck: use the built-in --ping client mode to connect via UDS
+# and send a PING. The server responds with 0x10 (OK) for a successful PING.
+# This replaces the broken nc/printf/grep approach (nc not installed, dash
+# printf doesn't support \xHH, grep \x10 is locale-dependent).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=2s --retries=3 \
-    CMD ["/bin/sh", "-c", "printf '\\x00\\x00\\x00\\x01\\x03' | nc -U $KVR_SOCKET_PATH | head -c 5 | grep -q '\\x10'"]
+    CMD /usr/local/bin/kvr-server --ping "$KVR_SOCKET_PATH"
 
 # Run the server.
 ENTRYPOINT ["kvr-server"]

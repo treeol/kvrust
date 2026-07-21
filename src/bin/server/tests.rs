@@ -1652,6 +1652,39 @@ mod uds_integration_tests {
 
         server.shutdown();
     }
+
+    // ─── Card 3: --ping healthcheck test ───────────────────────────────
+
+    #[test]
+    fn uds_ping_client() {
+        // Test the --ping client mode against a running UDS server.
+        // We can't easily spawn a separate process in unit tests, so we
+        // test the ping logic directly against the UDS server.
+        let socket_path = format!("/tmp/kvr_ping_test_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&socket_path);
+
+        let (server, _store) = UdsTestServer::bind(&socket_path);
+
+        // Connect and send a PING manually (simulating what ping_client does).
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        let mut stream = UnixStream::connect(&socket_path).expect("connect");
+
+        // Send PING frame: 4-byte length (1) + opcode (OP_PING).
+        let ping_frame = [0x00, 0x00, 0x00, 0x01, OP_PING];
+        stream.write_all(&ping_frame).expect("write");
+
+        // Read response frame.
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).expect("read len");
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        assert_eq!(resp_len, 1);
+        let mut resp = vec![0u8; resp_len];
+        stream.read_exact(&mut resp).expect("read resp");
+        assert_eq!(resp, vec![RESP_OK]);
+
+        server.shutdown();
+    }
 }
 
 // ─── Snapshot tests ──────────────────────────────────────────────────

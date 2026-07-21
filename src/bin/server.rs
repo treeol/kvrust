@@ -1078,10 +1078,68 @@ fn run_periodic_snapshot(
     eprintln!("snapshot thread exiting");
 }
 
+// ─── Ping client (Docker healthcheck) ─────────────────────────────────
+
+/// Connect to a UDS socket, send a PING, and verify the response.
+/// Exits 0 on success (RESP_OK), 1 on any error.
+/// Used by the Docker HEALTHCHECK — replaces the broken nc/printf/grep chain.
+#[cfg(unix)]
+fn ping_client(socket_path: &str) -> ! {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let exit_code = (|| -> Result<i32, ()> {
+        let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+            eprintln!("ping: failed to connect to {socket_path}: {e}");
+        })?;
+
+        // Set a read timeout so the healthcheck can't hang beyond Docker's timeout.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+
+        // Send PING frame: 4-byte length (1) + opcode (OP_PING).
+        let ping_frame = [0x00, 0x00, 0x00, 0x01, OP_PING];
+        stream.write_all(&ping_frame).map_err(|e| {
+            eprintln!("ping: failed to write: {e}");
+        })?;
+
+        // Read response frame.
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).map_err(|e| {
+            eprintln!("ping: failed to read response length: {e}");
+        })?;
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        if resp_len == 0 || resp_len > MAX_FRAME_SIZE {
+            eprintln!("ping: invalid response length {resp_len}");
+            return Ok(1);
+        }
+        let mut resp = vec![0u8; resp_len];
+        stream.read_exact(&mut resp).map_err(|e| {
+            eprintln!("ping: failed to read response: {e}");
+        })?;
+
+        // Verify the response is exactly [RESP_OK].
+        if resp == [RESP_OK] {
+            Ok(0)
+        } else {
+            eprintln!("ping: unexpected response: {resp:?}");
+            Ok(1)
+        }
+    })();
+    let exit_code = exit_code.unwrap_or(1);
+
+    std::process::exit(exit_code);
+}
+
 // ─── Production entry point ───────────────────────────────────────────
 
 #[cfg(unix)]
 fn main() {
+    // Docker healthcheck mode: kvr-server --ping <socket_path>
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "--ping" {
+        ping_client(&args[2]);
+    }
+
     let socket_path =
         std::env::var("KVR_SOCKET_PATH").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
     let tcp_addr = std::env::var("KVR_TCP_ADDR"); // optional secondary TCP
