@@ -19,6 +19,45 @@ jobs:
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
       - name: Tests
         run: cargo test
+      - name: Release build
+        run: cargo build --release --bins
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.70.0
+      - name: Check MSRV
+        run: cargo check --all-targets
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t kvr .
+      - name: Run and verify healthcheck
+        run: |
+          docker run -d --name kvr-test \
+            --health-interval=2s --health-timeout=3s --health-retries=10 \
+            kvr
+          for i in $(seq 1 30); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' kvr-test)
+            if [ "$status" = "healthy" ]; then exit 0; fi
+            if [ "$status" = "unhealthy" ]; then docker logs kvr-test; exit 1; fi
+            sleep 1
+          done
+          docker logs kvr-test
+          exit 1
+      - name: Cleanup
+        if: always
+        run: docker rm -f kvr-test 2>/dev/null || true

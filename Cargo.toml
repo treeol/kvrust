@@ -2,6 +2,7 @@
 name = "kvr"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.70"
 description = "A lightweight, sharded, concurrent in-memory key-value store with a Unix Domain Socket server for IPC"
 license = "Apache-2.0"
 repository = "https://github.com/treeol/kvrust"
