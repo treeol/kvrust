@@ -238,11 +238,19 @@ fn dispatch(frame: &[u8], store: &ShardedKV, snapshot: &Option<Arc<SnapshotManag
             };
             match store.get(&key_str) {
                 Some(val) => {
-                    let mut resp = Vec::with_capacity(1 + 4 + val.len());
-                    resp.push(RESP_OK);
-                    resp.extend_from_slice(&(val.len() as u32).to_be_bytes());
-                    resp.extend_from_slice(&val);
-                    resp
+                    // Guard against oversized responses — values can enter
+                    // via library API or snapshot load, not just the wire.
+                    let total_size = 1usize.checked_add(4).and_then(|n| n.checked_add(val.len()));
+                    match total_size {
+                        Some(size) if size <= MAX_FRAME_SIZE => {
+                            let mut resp = Vec::with_capacity(size);
+                            resp.push(RESP_OK);
+                            resp.extend_from_slice(&(val.len() as u32).to_be_bytes());
+                            resp.extend_from_slice(&val);
+                            resp
+                        }
+                        _ => vec![RESP_ERROR], // oversized response
+                    }
                 }
                 None => vec![RESP_NOT_FOUND],
             }
@@ -391,7 +399,14 @@ fn dispatch(frame: &[u8], store: &ShardedKV, snapshot: &Option<Arc<SnapshotManag
 
             // Pre-compute response size to check against MAX_FRAME_SIZE.
             // Response = 1 (OK) + 2 (count) + Σ(2 + key_len) + 1 (more-flag).
-            let total_size: usize = 1 + 2 + keys.iter().map(|k| 2 + k.len()).sum::<usize>() + 1;
+            // Guard against oversized keys (can enter via library API, not wire).
+            let mut total_size: usize = 1 + 2 + 1;
+            for key in &keys {
+                if key.len() > u16::MAX as usize {
+                    return vec![RESP_ERROR];
+                }
+                total_size += 2 + key.len();
+            }
             if total_size > MAX_FRAME_SIZE {
                 return vec![RESP_ERROR];
             }
@@ -797,6 +812,20 @@ impl SnapshotManager {
         buf.extend_from_slice(SNAPSHOT_MAGIC);
         buf.extend_from_slice(&(entries.len() as u64).to_be_bytes());
         for (key, value, expires_at) in &entries {
+            // Guard against silent truncation — keys/values larger than the
+            // format limits must not be silently cast down.
+            if key.len() > u16::MAX as usize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("snapshot key too long ({} bytes, max {})", key.len(), u16::MAX),
+                ));
+            }
+            if value.len() > u32::MAX as usize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("snapshot value too long ({} bytes, max {})", value.len(), u32::MAX),
+                ));
+            }
             let key_len = key.len() as u16;
             buf.extend_from_slice(&key_len.to_be_bytes());
             buf.extend_from_slice(key.as_bytes());

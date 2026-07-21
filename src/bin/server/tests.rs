@@ -927,6 +927,74 @@ mod protocol_tests {
         let frame = vec![OP_TTL, 0x00, 0x00];
         assert_eq!(dispatch(&frame, &store, &None), vec![RESP_NOT_FOUND]);
     }
+
+    // ─── Card 2 new tests ──────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_get_oversized_value() {
+        // A value larger than MAX_FRAME_SIZE entered via library API
+        // (not the wire protocol) should return RESP_ERROR on GET, not
+        // an oversized response frame.
+        let store = ShardedKV::new();
+        let big_val = vec![0u8; MAX_FRAME_SIZE + 1];
+        store.set("big", big_val);
+
+        let frame = make_get("big");
+        let resp = dispatch(&frame, &store, &None);
+        assert_eq!(resp, vec![RESP_ERROR]);
+    }
+
+    #[test]
+    fn dispatch_get_normal_value_still_works() {
+        // Regression guard: normal GET must still work after adding
+        // the oversized response check.
+        let store = ShardedKV::new();
+        store.set("key", b"value".to_vec());
+
+        let frame = make_get("key");
+        let resp = dispatch(&frame, &store, &None);
+        assert_eq!(resp[0], RESP_OK);
+    }
+
+    #[test]
+    fn dispatch_get_boundary_max_size() {
+        // Value of exactly MAX_FRAME_SIZE - 5 (1 + 4 + val = MAX_FRAME_SIZE)
+        // should be the largest accepted GET response.
+        let store = ShardedKV::new();
+        let val = vec![0u8; MAX_FRAME_SIZE - 5];
+        store.set("boundary", val);
+
+        let frame = make_get("boundary");
+        let resp = dispatch(&frame, &store, &None);
+        assert_eq!(resp[0], RESP_OK);
+        assert_eq!(resp.len(), MAX_FRAME_SIZE);
+    }
+
+    #[test]
+    fn dispatch_get_one_byte_over_boundary() {
+        // Value of MAX_FRAME_SIZE - 4 (total = MAX_FRAME_SIZE + 1) should
+        // be rejected.
+        let store = ShardedKV::new();
+        let val = vec![0u8; MAX_FRAME_SIZE - 4];
+        store.set("over", val);
+
+        let frame = make_get("over");
+        let resp = dispatch(&frame, &store, &None);
+        assert_eq!(resp, vec![RESP_ERROR]);
+    }
+
+    #[test]
+    fn dispatch_scan_oversized_key() {
+        // A key longer than u16::MAX entered via library API should
+        // return RESP_ERROR from SCAN, not a truncated response.
+        let store = ShardedKV::new();
+        let big_key = "x".repeat(u16::MAX as usize + 1);
+        store.set(&big_key, b"v".to_vec());
+
+        let frame = make_scan("", 100, "");
+        let resp = dispatch(&frame, &store, &None);
+        assert_eq!(resp, vec![RESP_ERROR]);
+    }
 }
 
 // ─── Sweeper tests ───────────────────────────────────────────────────
@@ -1882,6 +1950,47 @@ mod snapshot_tests {
 
         let entries = SnapshotManager::load(std::path::Path::new(&path)).expect("load");
         assert!(entries.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── Card 2 new tests ──────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_save_oversized_key() {
+        // A key longer than u16::MAX (65535) entered via library API
+        // should cause save() to return an error, not silently truncate.
+        let path = temp_snapshot_path();
+        let store = ShardedKV::new();
+        let big_key = "x".repeat(u16::MAX as usize + 1);
+        store.set(&big_key, b"v".to_vec());
+
+        let mgr = SnapshotManager::new(std::path::PathBuf::from(&path));
+        let result = mgr.save(&store);
+        assert!(result.is_err(), "save should fail for oversized key");
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // No snapshot file should have been written.
+        assert!(!path_exists(&path));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn snapshot_save_normal_keys_still_work() {
+        // Regression guard: normal keys must still save successfully
+        // after adding the oversized key guard.
+        let path = temp_snapshot_path();
+        let store = ShardedKV::new();
+        store.set("normal_key", b"val".to_vec());
+
+        let mgr = SnapshotManager::new(std::path::PathBuf::from(&path));
+        mgr.save(&store).expect("save should succeed");
+
+        let entries = SnapshotManager::load(std::path::Path::new(&path)).expect("load");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "normal_key");
 
         let _ = std::fs::remove_file(&path);
     }
