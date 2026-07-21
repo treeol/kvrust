@@ -66,13 +66,16 @@ fn hash_key(key: &str) -> usize {
 ///
 /// Uses `SystemTime` (wall clock) rather than a monotonic clock. Wall-clock
 /// semantics are accepted here because TTL expiry timestamps may need to be
-/// serialized and restored across restarts (future snapshot persistence),
-/// so they must be comparable to real-world time.
+/// serialized and restored across restarts (snapshot persistence), so they
+/// must be comparable to real-world time.
+///
+/// Returns 0 if the system clock is before the UNIX epoch (extremely rare,
+/// but avoids a panic in server threads that don't have `catch_unwind`).
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock is before UNIX epoch")
-        .as_millis() as u64
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// A stored entry: a value with an optional expiry timestamp.
@@ -165,6 +168,28 @@ pub struct ShardedKV {
     entry_count: AtomicU64,
 }
 
+/// RAII guard that decrements `entry_count` on drop unless `commit()` is called.
+/// Closes the panic window between reserving a slot and inserting into the map.
+struct EntryReservation<'a> {
+    count: &'a AtomicU64,
+    committed: bool,
+}
+
+impl EntryReservation<'_> {
+    /// Mark the reservation as committed — `Drop` will no longer decrement.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for EntryReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 impl ShardedKV {
     /// Create a new ShardedKV with no entry limit (unlimited).
     pub fn new() -> Self {
@@ -228,17 +253,24 @@ impl ShardedKV {
     pub fn set(&self, key: &str, value: Vec<u8>) -> bool {
         let shard = self.shard(key);
         let mut guard = shard.write();
-        if guard.contains_key(key) {
-            // Overwrite — no count change, clear any existing TTL.
-            guard.insert(key.to_string(), Entry::new(value));
-            return true;
+        use std::collections::hash_map::Entry as MapEntry;
+        match guard.entry(key.to_string()) {
+            MapEntry::Occupied(mut e) => {
+                // Overwrite — no count change, clear any existing TTL.
+                e.insert(Entry::new(value));
+                true
+            }
+            MapEntry::Vacant(e) => {
+                // New key — atomically reserve a slot.
+                let reservation = match self.try_reserve_entry_guard() {
+                    Some(r) => r,
+                    None => return false, // store full
+                };
+                e.insert(Entry::new(value));
+                reservation.commit();
+                true
+            }
         }
-        // New key — atomically reserve a slot.
-        if !self.try_reserve_entry() {
-            return false; // store full
-        }
-        guard.insert(key.to_string(), Entry::new(value));
-        true
     }
 
     /// Set a key-value pair with a TTL. `ttl_ms` is relative milliseconds from
@@ -253,31 +285,42 @@ impl ShardedKV {
         let expires_at = now_ms().saturating_add(ttl_ms);
         let shard = self.shard(key);
         let mut guard = shard.write();
-        if guard.contains_key(key) {
-            // Overwrite — no count change, set new TTL.
-            guard.insert(key.to_string(), Entry::with_expiry(value, expires_at));
-            return true;
+        use std::collections::hash_map::Entry as MapEntry;
+        match guard.entry(key.to_string()) {
+            MapEntry::Occupied(mut e) => {
+                // Overwrite — no count change, set new TTL.
+                e.insert(Entry::with_expiry(value, expires_at));
+                true
+            }
+            MapEntry::Vacant(e) => {
+                // New key — atomically reserve a slot.
+                let reservation = match self.try_reserve_entry_guard() {
+                    Some(r) => r,
+                    None => return false, // store full
+                };
+                e.insert(Entry::with_expiry(value, expires_at));
+                reservation.commit();
+                true
+            }
         }
-        // New key — atomically reserve a slot.
-        if !self.try_reserve_entry() {
-            return false;
-        }
-        guard.insert(key.to_string(), Entry::with_expiry(value, expires_at));
-        true
     }
 
     /// Atomically reserve an entry slot using CAS.
-    /// Returns false if the store is at max capacity.
-    fn try_reserve_entry(&self) -> bool {
+    /// Returns a guard that decrements the count on drop unless committed.
+    /// Returns `None` if the store is at max capacity.
+    fn try_reserve_entry_guard(&self) -> Option<EntryReservation<'_>> {
         if self.max_entries == 0 {
             self.entry_count.fetch_add(1, Ordering::Relaxed);
-            return true;
+            return Some(EntryReservation {
+                count: &self.entry_count,
+                committed: false,
+            });
         }
         let max = self.max_entries as u64;
         let mut current = self.entry_count.load(Ordering::Relaxed);
         loop {
             if current >= max {
-                return false;
+                return None;
             }
             match self.entry_count.compare_exchange_weak(
                 current,
@@ -285,7 +328,12 @@ impl ShardedKV {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    return Some(EntryReservation {
+                        count: &self.entry_count,
+                        committed: false,
+                    })
+                }
                 Err(actual) => current = actual,
             }
         }
@@ -297,19 +345,19 @@ impl ShardedKV {
         let now = now_ms();
         let shard = self.shard(key);
         let mut guard = shard.write();
-        if let Some(entry) = guard.get(key) {
-            if entry.is_expired(now) {
-                // Expired — remove and decrement count, return None.
-                guard.remove(key);
+        match guard.remove(key) {
+            Some(entry) if entry.is_expired(now) => {
+                // Expired — already removed, decrement count, return None.
                 self.entry_count.fetch_sub(1, Ordering::Relaxed);
-                return None;
+                None
             }
+            Some(entry) => {
+                // Live entry — already removed, decrement count.
+                self.entry_count.fetch_sub(1, Ordering::Relaxed);
+                Some(entry.value)
+            }
+            None => None,
         }
-        let result = guard.remove(key);
-        if result.is_some() {
-            self.entry_count.fetch_sub(1, Ordering::Relaxed);
-        }
-        result.map(|e| e.value)
     }
 
     /// Query the TTL of a key. Returns `None` if the key doesn't exist or has
@@ -503,19 +551,27 @@ impl ShardedKV {
         for key in keys {
             let shard = self.shard(key);
 
-            // Fast path: read lock.
+            // Fast path: read lock — distinguish three states:
+            // - found: entry exists and is live → no write lock needed.
+            // - needs_removal: entry exists but is expired → write lock to remove.
+            // - absent: entry doesn't exist → no write lock needed.
             let mut found = None;
+            let mut needs_removal = false;
             {
                 let guard = shard.read();
                 if let Some(entry) = guard.get(key) {
-                    if !entry.is_expired(now) {
+                    if entry.is_expired(now) {
+                        needs_removal = true;
+                    } else {
                         found = Some(entry.value.clone());
                     }
                 }
             }
 
-            if found.is_none() {
-                // Slow path: entry is expired or missing. If expired, remove it.
+            // Slow path: only for expired entries (not plain misses).
+            // Re-check under write lock: another thread may have already
+            // removed it or overwritten it with a live value.
+            if needs_removal {
                 let mut guard = shard.write();
                 if let Some(entry) = guard.get(key) {
                     if entry.is_expired(now) {
@@ -583,12 +639,14 @@ impl ShardedKV {
 
     /// Returns the current number of entries in the store.
     ///
-    /// This is a physical count that includes expired-but-not-yet-removed
-    /// entries. Expired entries are removed (and the count decremented) when
-    /// accessed via `get`/`contains`/`del`/`scan`/`ttl` or when the sweeper runs.
+    /// This is an approximate physical count under concurrent mutation.
+    /// It includes expired-but-not-yet-removed entries, and may briefly
+    /// include reserved-but-not-yet-inserted entries. Expired entries are
+    /// removed (and the count decremented) when accessed via
+    /// `get`/`contains`/`del`/`scan`/`ttl` or when the sweeper runs.
     /// See also [`len_active`](Self::len_active) for the logical non-expired count.
     pub fn len(&self) -> u64 {
-        self.entry_count.load(Ordering::Acquire)
+        self.entry_count.load(Ordering::Relaxed)
     }
 
     /// Returns the number of non-expired entries in the store.
@@ -1395,5 +1453,86 @@ mod tests {
         assert_eq!(store.len(), 2);
         // len_active() excludes it.
         assert_eq!(store.len_active(), 1);
+    }
+
+    // ─── Card 1 new tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_set_full_store_rejects_new_key() {
+        // Verify the entry()-based refactor still rejects new keys when full.
+        let store = ShardedKV::with_max_entries(2);
+        assert!(store.set("a", b"1".to_vec()));
+        assert!(store.set("b", b"2".to_vec()));
+        // Store is full — new key rejected.
+        assert!(!store.set("c", b"3".to_vec()));
+        // Overwriting existing key still works.
+        assert!(store.set("a", b"updated".to_vec()));
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn test_set_overwrite_expired_entry() {
+        // Overwriting an expired-but-unswept key should NOT change the count.
+        // The entry() API treats it as Occupied (overwrite, no count change).
+        let store = ShardedKV::with_max_entries(5);
+        assert!(store.set_with_ttl("k", b"v1".to_vec(), 50));
+        assert_eq!(store.len(), 1);
+
+        // Wait for expiry but don't sweep — the key is still in the map.
+        thread::sleep(Duration::from_millis(80));
+
+        // Overwrite with a permanent entry. The key exists in the map
+        // (expired but not removed), so entry() sees Occupied.
+        // Count should NOT change (no new entry added).
+        assert!(store.set("k", b"v2".to_vec()));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get("k"), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn test_mget_plain_miss_no_write_lock() {
+        // mget on absent keys should not inflate count or cause issues.
+        // This is a functional regression guard for the tri-state fix.
+        let store = ShardedKV::new();
+        store.set("present", b"val".to_vec());
+        assert_eq!(store.len(), 1);
+
+        // mget with a mix of present and absent keys.
+        let results = store.mget(&[
+            "present".to_string(),
+            "absent1".to_string(),
+            "absent2".to_string(),
+            "absent3".to_string(),
+        ]);
+
+        assert_eq!(results[0], Some(b"val".to_vec()));
+        assert_eq!(results[1], None);
+        assert_eq!(results[2], None);
+        assert_eq!(results[3], None);
+
+        // Count must be unchanged — absent keys should not have triggered
+        // any write-lock path that could corrupt state.
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn test_del_single_remove_semantics() {
+        // Verify the refactored del() (single remove) preserves semantics.
+        let store = ShardedKV::new();
+        store.set("live", b"val".to_vec());
+        assert_eq!(store.del("live"), Some(b"val".to_vec()));
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.get("live"), None);
+
+        // del on missing key.
+        assert_eq!(store.del("missing"), None);
+        assert_eq!(store.len(), 0);
+
+        // del on expired key returns None, decrements count.
+        store.set_with_ttl("temp", b"v".to_vec(), 50);
+        assert_eq!(store.len(), 1);
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(store.del("temp"), None);
+        assert_eq!(store.len(), 0);
     }
 }
