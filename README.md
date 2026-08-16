@@ -303,8 +303,8 @@ The container runs as a non-root user (`kvr`), with the socket directory at `/ru
 
 ## Tests
 
-- **51 library tests** — basic CRUD, empty values, large values, concurrent access, memory bounds, entry counting, TTL (lazy expiry, sweeper, SET-after-SETX, capacity freed, concurrent races, ttl command), SCAN (basic, pagination, prefix, expired exclusion, expired purge, capacity freed, limit-zero), MGET (mixed, ordering, expired exclusion), snapshot (collect_for_snapshot, load_entry), len_active
-- **90 server tests** — protocol unit tests (all 10 opcodes, error conditions, trailing bytes, invalid UTF-8, SETX/SCAN/MGET/SAVE/TTL edge cases), sweeper tests, snapshot tests (save/load roundtrip, expired-at-save filtered, corrupted file, bad magic, truncated file, .tmp-crash, concurrent save, over-capacity load, SAVE dispatch), TCP wire tests, UDS wire tests (roundtrip, large value, errors, SETX, SCAN pagination/prefix, MGET mixed/overflow, TTL roundtrip)
+- **55 library tests** — basic CRUD, empty values, large values, concurrent access, memory bounds, entry counting, TTL (lazy expiry, sweeper, SET-after-SETX, capacity freed, concurrent races, ttl command), SCAN (basic, pagination, prefix, expired exclusion, expired purge, capacity freed, limit-zero), MGET (mixed, ordering, expired exclusion), snapshot (collect_for_snapshot, load_entry), len_active
+- **98 server tests** — protocol unit tests (all 10 opcodes, error conditions, trailing bytes, invalid UTF-8, SETX/SCAN/MGET/SAVE/TTL edge cases), sweeper tests, snapshot tests (save/load roundtrip, expired-at-save filtered, corrupted file, bad magic, truncated file, .tmp-crash, concurrent save, over-capacity load, SAVE dispatch), TCP wire tests, UDS wire tests (roundtrip, large value, errors, SETX, SCAN pagination/prefix, MGET mixed/overflow, TTL roundtrip)
 - **2 doctests** — crate-level usage example and ShardedKV usage example (set, get, set_with_ttl)
 
 ## Versioning
