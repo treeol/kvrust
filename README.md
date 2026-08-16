@@ -276,6 +276,10 @@ Single-key operations (GET, TTL, EXISTS) achieve 14–16M ops/sec. MGET batches
 10 keys per call at 1.7M ops/sec (17.3M keys/sec). SCAN is O(n) per call —
 ~1ms per scan over 100K entries. SWEEP purges 100K expired entries in 230ms.
 
+Note on the DEL figure: the bench re-sets a key before deleting it to measure
+`del` on a live key, but only the delete is counted toward ops/sec (the set
+is a warm-up), so the DEL throughput above reflects deletes alone.
+
 ## Docker
 
 ```bash

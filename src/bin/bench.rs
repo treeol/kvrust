@@ -105,9 +105,10 @@ fn main() {
             let key_idx = i % num_keys;
             let key = &keys[key_idx as usize];
             // Re-set then immediately delete — measures del on a live key.
+            // Only the delete is counted; the set is a warm-up.
             store.set(key, b"v".to_vec());
             let _ = store.del(key);
-            2
+            1
         }
     });
 

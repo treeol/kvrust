@@ -27,19 +27,27 @@ const ACCEPT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 // ─── Shutdown flag ────────────────────────────────────────────────────
 
-struct ShutdownFlag(AtomicBool);
+/// Shared shutdown flag. Wraps an `Arc<AtomicBool>` so the same atomic can be
+/// handed to the safe `signal_hook::flag::register` handlers.
+struct ShutdownFlag(Arc<AtomicBool>);
 
 impl ShutdownFlag {
     fn new() -> Arc<Self> {
-        Arc::new(Self(AtomicBool::new(false)))
+        Arc::new(Self(Arc::new(AtomicBool::new(false))))
     }
 
     fn is_set(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     fn signal(&self) {
         self.0.store(true, Ordering::Release);
+    }
+
+    /// The underlying atomic, for sharing with signal handlers.
+    fn raw(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
     }
 }
 
@@ -307,27 +315,19 @@ impl Drop for SocketCleanup {
 
 // ─── Signal handling ──────────────────────────────────────────────────
 
-/// Install SIGTERM and SIGINT handlers that signal the shutdown flag.
+/// Install SIGTERM and SIGINT handlers that set the shutdown flag.
 /// Panics if registration fails — without signal handlers, the server
 /// cannot be gracefully stopped.
+///
+/// Uses the safe `signal_hook::flag::register`, which installs the
+/// handler and stores `true` (SeqCst) into the shared atomic on signal
+/// delivery — no `unsafe` needed in this crate.
 fn install_signal_handlers(shutdown: Arc<ShutdownFlag>) {
-    let shutdown_clone = Arc::clone(&shutdown);
-    // SAFETY: The closure only performs an atomic store, which is
-    // async-signal-safe. signal_hook::low_level::register installs a
-    // signal handler that calls this closure on signal delivery.
-    unsafe {
-        signal_hook::low_level::register(signal_hook::consts::SIGTERM, move || {
-            shutdown_clone.signal();
-        })
+    let flag = shutdown.raw();
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&flag))
         .expect("failed to register SIGTERM handler");
-    }
-    let shutdown_clone = Arc::clone(&shutdown);
-    unsafe {
-        signal_hook::low_level::register(signal_hook::consts::SIGINT, move || {
-            shutdown_clone.signal();
-        })
+    signal_hook::flag::register(signal_hook::consts::SIGINT, flag)
         .expect("failed to register SIGINT handler");
-    }
 }
 
 // ─── CRC32 (bitwise, hand-rolled) ─────────────────────────────────────
