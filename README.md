@@ -195,6 +195,14 @@ All configuration is via environment variables:
 | `KVR_SNAPSHOT_ON_SHUTDOWN` | `true` | Save snapshot on graceful shutdown (when path set) |
 | `KVR_SNAPSHOT_INTERVAL_SECS` | `0` | Periodic snapshot interval in seconds (0 = disabled) |
 
+Numeric values must parse as their type, and `KVR_SNAPSHOT_ON_SHUTDOWN` must
+be a boolean (`true`/`false`). A malformed value makes the server **refuse to
+start** rather than silently fall back to a default, so a typo in a
+safety-relevant limit is surfaced immediately. An empty value is treated as
+unset (default applies). `KVR_MAX_CONNECTIONS` must be `> 0` (a value of `0`
+creates a semaphore that can never admit a connection). The effective
+configuration is printed to stderr at startup.
+
 ## Building
 
 ```bash

@@ -619,10 +619,13 @@ impl ShardedKV {
         entries
     }
 
-    /// Load a single entry during snapshot restore. Bypasses max-entries CAS
-    /// — we are restoring persisted state, not accepting new writes. The
-    /// entry_count is incremented directly. If the key already exists, the
-    /// value is overwritten without a count change.
+    /// Load a single entry during snapshot restore. **Restore-only API: it
+    /// deliberately bypasses the max-entries CAS guard, so it must NOT be
+    /// used for normal writes** — doing so lets the store exceed the
+    /// `with_max_entries` bound. It exists solely so a persisted snapshot can
+    /// be reloaded even if it was taken under a larger (or unlimited) bound.
+    /// The entry_count is incremented directly. If the key already exists,
+    /// the value is overwritten without a count change.
     pub fn load_entry(&self, key: String, value: Vec<u8>, expires_at: Option<u64>) {
         let shard = self.shard(&key);
         let mut guard = shard.write();

@@ -730,6 +730,72 @@ fn ping_client(socket_path: &str) -> ! {
     std::process::exit(exit_code);
 }
 
+// ─── Configuration ────────────────────────────────────────────────────
+
+/// Server configuration parsed from `KVR_*` environment variables.
+///
+/// Fails startup on any malformed value instead of silently falling back to a
+/// default, so a typo in a safety-relevant limit can't change behavior
+/// unnoticed. String-typed vars (`KVR_SOCKET_PATH`, `KVR_TCP_ADDR`,
+/// `KVR_SNAPSHOT_PATH`) are not parsed and keep their original lenient
+/// handling.
+#[cfg(unix)]
+struct Config {
+    socket_path: String,
+    tcp_addr: Option<String>,
+    max_entries: usize,
+    max_connections: usize,
+    sweep_interval_secs: u64,
+    snapshot_path: Option<String>,
+    snapshot_on_shutdown: bool,
+    snapshot_interval_secs: u64,
+}
+
+#[cfg(unix)]
+impl Config {
+    fn load() -> Self {
+        // Parse a numeric/bool env var. Unset or empty -> default. Malformed ->
+        // refuse to start (a silent default would hide a typo).
+        fn parse<T>(var: &str, default: T) -> T
+        where
+            T: std::str::FromStr,
+            T::Err: std::fmt::Display,
+        {
+            match std::env::var(var) {
+                Ok(v) if v.is_empty() => default,
+                Ok(v) => match v.parse() {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        eprintln!("kvr: invalid {var}={v:?} ({e}); refusing to start");
+                        std::process::exit(1);
+                    }
+                },
+                Err(_) => default,
+            }
+        }
+
+        let max_connections = parse("KVR_MAX_CONNECTIONS", MAX_CONNECTIONS);
+        if max_connections == 0 {
+            eprintln!("kvr: KVR_MAX_CONNECTIONS must be > 0; refusing to start");
+            std::process::exit(1);
+        }
+
+        Self {
+            socket_path: std::env::var("KVR_SOCKET_PATH")
+                .unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string()),
+            tcp_addr: std::env::var("KVR_TCP_ADDR").ok(),
+            max_entries: parse("KVR_MAX_ENTRIES", 100_000usize),
+            max_connections,
+            sweep_interval_secs: parse("KVR_SWEEP_INTERVAL_SECS", 30u64),
+            snapshot_path: std::env::var("KVR_SNAPSHOT_PATH")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            snapshot_on_shutdown: parse("KVR_SNAPSHOT_ON_SHUTDOWN", true),
+            snapshot_interval_secs: parse("KVR_SNAPSHOT_INTERVAL_SECS", 0u64),
+        }
+    }
+}
+
 // ─── Production entry point ───────────────────────────────────────────
 
 #[cfg(unix)]
@@ -740,34 +806,24 @@ fn main() {
         ping_client(&args[2]);
     }
 
-    let socket_path =
-        std::env::var("KVR_SOCKET_PATH").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
-    let tcp_addr = std::env::var("KVR_TCP_ADDR"); // optional secondary TCP
-    let max_entries: usize = std::env::var("KVR_MAX_ENTRIES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100_000);
-    let max_connections: usize = std::env::var("KVR_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(MAX_CONNECTIONS);
-    let sweep_interval_secs: u64 = std::env::var("KVR_SWEEP_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
-
-    // Snapshot configuration.
-    let snapshot_path = std::env::var("KVR_SNAPSHOT_PATH")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let snapshot_on_shutdown: bool = std::env::var("KVR_SNAPSHOT_ON_SHUTDOWN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(true); // default true when path set
-    let snapshot_interval_secs: u64 = std::env::var("KVR_SNAPSHOT_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0); // 0 = disabled
+    // Parse configuration (fails startup on malformed values).
+    let config = Config::load();
+    let Config {
+        socket_path,
+        tcp_addr,
+        max_entries,
+        max_connections,
+        sweep_interval_secs,
+        snapshot_path,
+        snapshot_on_shutdown,
+        snapshot_interval_secs,
+    } = config;
+    eprintln!(
+        "kvr config: socket={socket_path}, max_entries={max_entries} (0 = unlimited), \
+         max_connections={max_connections}, sweep_interval={sweep_interval_secs}s (0 = disabled), \
+         snapshot_path={snapshot_path:?}, snapshot_on_shutdown={snapshot_on_shutdown}, \
+         snapshot_interval={snapshot_interval_secs}s (0 = disabled)"
+    );
 
     let store = Arc::new(if max_entries > 0 {
         ShardedKV::with_max_entries(max_entries)
@@ -857,7 +913,7 @@ fn main() {
     );
 
     // Optionally start a secondary TCP listener (debug only — unauthenticated).
-    if let Ok(addr) = tcp_addr {
+    if let Some(addr) = tcp_addr {
         eprintln!("WARNING: TCP listener enabled on {addr} — unauthenticated, use for debug only");
         let shutdown_tcp = Arc::clone(&shutdown);
         let store_tcp = Arc::clone(&store);
