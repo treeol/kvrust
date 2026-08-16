@@ -105,7 +105,14 @@ pub fn dispatch(frame: &[u8], store: &ShardedKV, snapshot: Option<&dyn SnapshotS
                 rest[val_start + 2],
                 rest[val_start + 3],
             ]) as usize;
-            let val_end = val_start + 4 + val_len;
+            // Checked: `dispatch` is public and can receive frames without
+            // the `read_frame` size cap; on 32-bit targets a crafted
+            // val_len near u32::MAX would overflow usize and mis-pass the
+            // bounds check below.
+            let val_end = match val_start.checked_add(4).and_then(|e| e.checked_add(val_len)) {
+                Some(end) => end,
+                None => return vec![RESP_ERROR],
+            };
             if rest.len() != val_end {
                 return vec![RESP_ERROR];
             }
@@ -219,8 +226,18 @@ pub fn dispatch(frame: &[u8], store: &ShardedKV, snapshot: Option<&dyn SnapshotS
                 rest[val_start + 2],
                 rest[val_start + 3],
             ]) as usize;
-            let val_end = val_start + 4 + val_len;
-            let ttl_end = val_end + 8;
+            // Checked: `dispatch` is public and can receive frames without
+            // the `read_frame` size cap; on 32-bit targets a crafted
+            // val_len near u32::MAX would overflow usize and mis-pass the
+            // bounds check below.
+            let val_end = match val_start.checked_add(4).and_then(|e| e.checked_add(val_len)) {
+                Some(end) => end,
+                None => return vec![RESP_ERROR],
+            };
+            let ttl_end = match val_end.checked_add(8) {
+                Some(end) => end,
+                None => return vec![RESP_ERROR],
+            };
             if rest.len() != ttl_end {
                 return vec![RESP_ERROR];
             }
