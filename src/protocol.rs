@@ -120,7 +120,8 @@ pub fn dispatch(frame: &[u8], store: &ShardedKV, snapshot: Option<&dyn SnapshotS
                 Ok(s) => s.to_string(),
                 Err(_) => return vec![RESP_ERROR],
             };
-            let val = &rest[val_start + 4..val_start + 4 + val_len];
+            // `val_end` was proven in-bounds above, so this slice is safe.
+            let val = &rest[val_start + 4..val_end];
             if store.set(&key_str, val.to_vec()) {
                 vec![RESP_OK]
             } else {
@@ -258,7 +259,7 @@ pub fn dispatch(frame: &[u8], store: &ShardedKV, snapshot: Option<&dyn SnapshotS
                 Ok(s) => s.to_string(),
                 Err(_) => return vec![RESP_ERROR],
             };
-            let val = &rest[val_start + 4..val_start + 4 + val_len];
+            let val = &rest[val_start + 4..val_end];
             if store.set_with_ttl(&key_str, val.to_vec(), ttl_ms) {
                 vec![RESP_OK]
             } else {

@@ -278,7 +278,10 @@ Single-key operations (GET, TTL, EXISTS) achieve 14–16M ops/sec. MGET batches
 
 Note on the DEL figure: the bench re-sets a key before deleting it to measure
 `del` on a live key, but only the delete is counted toward ops/sec (the set
-is a warm-up), so the DEL throughput above reflects deletes alone.
+is a warm-up). The sample table above predates that accounting fix — its DEL
+row double-counted (8,000,000 ops for 8 threads × 500,000 iterations); with
+the current code the same run reports 4,000,000 counted ops and roughly half
+the listed DEL ops/sec.
 
 ## Docker
 

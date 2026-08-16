@@ -436,14 +436,24 @@ impl SnapshotManager {
             std::path::PathBuf::from(tmp)
         };
         {
-            let mut file = std::fs::File::create(&tmp_path)?;
             // The snapshot holds all persisted data — restrict it to the
-            // owner, matching the 0600 socket. (Unix-only; otherwise the
-            // tmp file is created with default umask permissions.)
+            // owner, matching the 0600 socket. On Unix the file is created
+            // with mode 0600 up front (no permissive window); the
+            // set_permissions call also re-asserts 0600 if a stale .tmp from
+            // an earlier crash already existed (mode() only applies at
+            // creation).
+            let mut file: std::fs::File;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create(true).truncate(true).mode(0o600);
+                file = opts.open(&tmp_path)?;
                 file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            #[cfg(not(unix))]
+            {
+                file = std::fs::File::create(&tmp_path)?;
             }
             file.write_all(&buf)?;
             file.sync_all()?;
@@ -754,8 +764,9 @@ struct Config {
 #[cfg(unix)]
 impl Config {
     fn load() -> Self {
-        // Parse a numeric/bool env var. Unset or empty -> default. Malformed ->
-        // refuse to start (a silent default would hide a typo).
+        // Parse a numeric/bool env var. Unset or empty -> default. A present
+        // but malformed value (bad syntax, or non-UTF-8) -> refuse to start
+        // (a silent default would hide a typo).
         fn parse<T>(var: &str, default: T) -> T
         where
             T: std::str::FromStr,
@@ -770,7 +781,13 @@ impl Config {
                         std::process::exit(1);
                     }
                 },
-                Err(_) => default,
+                // Distinguish "unset" from "present but not valid UTF-8": the
+                // latter is a real config error and must not silently default.
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    eprintln!("kvr: {var} is set to a non-UTF-8 value; refusing to start");
+                    std::process::exit(1);
+                }
+                Err(std::env::VarError::NotPresent) => default,
             }
         }
 
@@ -819,7 +836,8 @@ fn main() {
         snapshot_interval_secs,
     } = config;
     eprintln!(
-        "kvr config: socket={socket_path}, max_entries={max_entries} (0 = unlimited), \
+        "kvr config: socket={socket_path:?}, tcp_addr={tcp_addr:?}, \
+         max_entries={max_entries} (0 = unlimited), \
          max_connections={max_connections}, sweep_interval={sweep_interval_secs}s (0 = disabled), \
          snapshot_path={snapshot_path:?}, snapshot_on_shutdown={snapshot_on_shutdown}, \
          snapshot_interval={snapshot_interval_secs}s (0 = disabled)"
