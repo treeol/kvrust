@@ -718,8 +718,6 @@ fn run_periodic_snapshot(
 /// Used by the Docker HEALTHCHECK — replaces the broken nc/printf/grep chain.
 #[cfg(unix)]
 fn ping_client(socket_path: &str) -> ! {
-    use std::os::unix::net::UnixStream;
-
     let exit_code = (|| -> Result<i32, ()> {
         let mut stream = UnixStream::connect(socket_path).map_err(|e| {
             eprintln!("ping: failed to connect to {socket_path}: {e}");
