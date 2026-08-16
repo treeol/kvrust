@@ -81,10 +81,6 @@ impl UdsTestServer {
         let _ = self.handle.join();
         let _ = std::fs::remove_file(&self.socket_path);
     }
-
-    pub fn socket_path(&self) -> &str {
-        &self.socket_path
-    }
 }
 
 // ─── Frame builders ───────────────────────────────────────────────────
@@ -1751,8 +1747,15 @@ mod snapshot_tests {
         let mgr = SnapshotManager::new(std::path::PathBuf::from(&path));
         mgr.save(&store).expect("save");
 
-        let mode = std::fs::metadata(&path).expect("metadata").permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "snapshot must be owner read/write only");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "snapshot must be owner read/write only"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

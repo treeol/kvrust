@@ -49,7 +49,10 @@ pub fn write_frame<W: Write>(writer: &mut W, payload: &[u8]) -> std::io::Result<
     if payload.len() > MAX_FRAME_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("oversized frame ({} bytes, max {MAX_FRAME_SIZE})", payload.len()),
+            format!(
+                "oversized frame ({} bytes, max {MAX_FRAME_SIZE})",
+                payload.len()
+            ),
         ));
     }
     let len = payload.len() as u32;
@@ -109,7 +112,10 @@ pub fn dispatch(frame: &[u8], store: &ShardedKV, snapshot: Option<&dyn SnapshotS
             // the `read_frame` size cap; on 32-bit targets a crafted
             // val_len near u32::MAX would overflow usize and mis-pass the
             // bounds check below.
-            let val_end = match val_start.checked_add(4).and_then(|e| e.checked_add(val_len)) {
+            let val_end = match val_start
+                .checked_add(4)
+                .and_then(|e| e.checked_add(val_len))
+            {
                 Some(end) => end,
                 None => return vec![RESP_ERROR],
             };
@@ -231,7 +237,10 @@ pub fn dispatch(frame: &[u8], store: &ShardedKV, snapshot: Option<&dyn SnapshotS
             // the `read_frame` size cap; on 32-bit targets a crafted
             // val_len near u32::MAX would overflow usize and mis-pass the
             // bounds check below.
-            let val_end = match val_start.checked_add(4).and_then(|e| e.checked_add(val_len)) {
+            let val_end = match val_start
+                .checked_add(4)
+                .and_then(|e| e.checked_add(val_len))
+            {
                 Some(end) => end,
                 None => return vec![RESP_ERROR],
             };

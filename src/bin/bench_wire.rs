@@ -1,5 +1,5 @@
+use kvr::protocol::{dispatch, read_frame, write_frame, OP_GET, OP_PING, OP_SET, RESP_OK};
 use kvr::ShardedKV;
-use kvr::protocol::{dispatch, read_frame, write_frame, OP_SET, OP_GET, OP_PING, RESP_OK};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::thread;
@@ -66,12 +66,7 @@ fn main() {
                         let mut reader = BufReader::new(reader);
                         let mut writer = BufWriter::new(s);
 
-                        loop {
-                            let frame = match read_frame(&mut reader) {
-                                Ok(f) => f,
-                                Err(_) => break,
-                            };
-
+                        while let Ok(frame) = read_frame(&mut reader) {
                             // Dispatch using the shared protocol layer.
                             let resp = dispatch(&frame, &store, None);
 

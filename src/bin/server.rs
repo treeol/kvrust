@@ -1,5 +1,5 @@
+use kvr::protocol::{dispatch, read_frame, write_frame, OP_PING, RESP_ERROR, RESP_OK};
 use kvr::{now_ms, ShardedKV};
-use kvr::protocol::{dispatch, read_frame, write_frame, OP_PING, RESP_OK, RESP_ERROR};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,8 +113,9 @@ fn handle_client<R: Read, W: Write>(
     loop {
         match read_frame(&mut reader) {
             Ok(frame) => {
-                let snap_ref: Option<&dyn kvr::protocol::SnapshotSaver> =
-                    snapshot.as_ref().map(|m| m.as_ref() as &dyn kvr::protocol::SnapshotSaver);
+                let snap_ref: Option<&dyn kvr::protocol::SnapshotSaver> = snapshot
+                    .as_ref()
+                    .map(|m| m.as_ref() as &dyn kvr::protocol::SnapshotSaver);
                 let resp = dispatch(&frame, &store, snap_ref);
                 if let Err(e) = write_frame(&mut writer, &resp) {
                     eprintln!("client write error: {e}");
@@ -406,13 +407,21 @@ impl SnapshotManager {
             if key.len() > u16::MAX as usize {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("snapshot key too long ({} bytes, max {})", key.len(), u16::MAX),
+                    format!(
+                        "snapshot key too long ({} bytes, max {})",
+                        key.len(),
+                        u16::MAX
+                    ),
                 ));
             }
             if value.len() > u32::MAX as usize {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("snapshot value too long ({} bytes, max {})", value.len(), u32::MAX),
+                    format!(
+                        "snapshot value too long ({} bytes, max {})",
+                        value.len(),
+                        u32::MAX
+                    ),
                 ));
             }
             let key_len = key.len() as u16;
@@ -472,10 +481,12 @@ impl SnapshotManager {
             } else {
                 parent
             };
-            let dir = std::fs::File::open(parent_dir)
-                .map_err(|e| std::io::Error::new(e.kind(), format!("open snapshot parent dir: {e}")))?;
-            dir.sync_all()
-                .map_err(|e| std::io::Error::new(e.kind(), format!("fsync snapshot parent dir: {e}")))?;
+            let dir = std::fs::File::open(parent_dir).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("open snapshot parent dir: {e}"))
+            })?;
+            dir.sync_all().map_err(|e| {
+                std::io::Error::new(e.kind(), format!("fsync snapshot parent dir: {e}"))
+            })?;
         }
 
         Ok(())
