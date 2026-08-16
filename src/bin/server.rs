@@ -437,6 +437,14 @@ impl SnapshotManager {
         };
         {
             let mut file = std::fs::File::create(&tmp_path)?;
+            // The snapshot holds all persisted data — restrict it to the
+            // owner, matching the 0600 socket. (Unix-only; otherwise the
+            // tmp file is created with default umask permissions.)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
             file.write_all(&buf)?;
             file.sync_all()?;
         }
@@ -444,11 +452,20 @@ impl SnapshotManager {
         // Atomic rename to final path.
         std::fs::rename(&tmp_path, &self.path)?;
 
-        // fsync parent directory to make rename durable.
+        // fsync parent directory to make rename durable. Propagate
+        // failures — the crash-safety guarantee requires the rename to be
+        // durable, not merely visible. An empty parent (bare filename) is
+        // resolved against the current directory.
         if let Some(parent) = self.path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+            let parent_dir = if parent.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                parent
+            };
+            let dir = std::fs::File::open(parent_dir)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("open snapshot parent dir: {e}")))?;
+            dir.sync_all()
+                .map_err(|e| std::io::Error::new(e.kind(), format!("fsync snapshot parent dir: {e}")))?;
         }
 
         Ok(())

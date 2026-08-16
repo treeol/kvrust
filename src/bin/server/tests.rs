@@ -1741,6 +1741,23 @@ mod snapshot_tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn snapshot_file_has_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_snapshot_path();
+        let store = ShardedKV::new();
+        store.set("a", b"val_a".to_vec());
+
+        let mgr = SnapshotManager::new(std::path::PathBuf::from(&path));
+        mgr.save(&store).expect("save");
+
+        let mode = std::fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "snapshot must be owner read/write only");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn save_with_ttl_preserves_expiry() {
         let path = temp_snapshot_path();
         let store = ShardedKV::new();
