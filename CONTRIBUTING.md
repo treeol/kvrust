@@ -18,8 +18,8 @@ All contributions must pass the CI checks. Run them locally before pushing:
 # Format check (must produce no diff)
 cargo fmt --check
 
-# Lint (warnings are errors)
-cargo clippy -- -D warnings
+# Lint (warnings are errors, includes tests/benches)
+cargo clippy --all-targets -- -D warnings
 
 # Tests
 cargo test

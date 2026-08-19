@@ -341,4 +341,4 @@ full text.
 ## Security
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting guidelines.
-- **CI** — GitHub Actions runs `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` on every push and PR.
+- **CI** — GitHub Actions runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, a `--release` build, an MSRV check (Rust 1.70), a `cargo audit` security scan, and a Docker build + healthcheck verification on every push and PR.
