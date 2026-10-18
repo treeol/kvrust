@@ -12,10 +12,20 @@
 //! - **Optional memory bounds** — enforce a max entry count via
 //!   [`ShardedKV::with_max_entries`]; atomic CAS ensures concurrent inserts
 //!   never exceed the limit.
-//! - **TTL with hybrid expiry** — entries can have an optional TTL set via
-//!   [`ShardedKV::set_with_ttl`]. Expired entries are removed lazily on access
-//!   (`get`/`contains`/`del`/`mget`/`scan`/`ttl`) and actively by
-//!   [`ShardedKV::sweep_expired`].
+//! - **TTL with strict read-time filtering** — entries can have an optional
+//!   TTL set via [`ShardedKV::set_with_ttl`]. Contract: no key- or
+//!   value-returning operation (`get`/`contains`/`del`/`ttl`/`mget`/`scan`,
+//!   plus `len_active` and `collect_for_snapshot`) ever returns, counts, or
+//!   persists an entry whose absolute expiry deadline (UNIX epoch ms) is at
+//!   or before the time sampled by that operation — regardless of whether
+//!   the background sweeper has run. Expiry is inclusive: at
+//!   `now == expires_at` the entry is already expired. Physical removal
+//!   (lazy purge on access, or [`ShardedKV::sweep_expired`]) is a
+//!   space-reclamation side effect, never a precondition for expiry.
+//!   Physical-count exceptions: `len()` and `is_empty()` include
+//!   expired-but-unremoved entries, `scan` with `limit == 0` returns
+//!   early without inspecting any entry, and a full store may reject
+//!   new keys (`STORE_FULL`) while expired entries still hold slots.
 //! - **Snapshot persistence** — save/load the entire store to a binary file with
 //!   CRC32 integrity, atomic rename, and expired-entry filtering on load.
 //!
@@ -58,6 +68,39 @@ const PER_SHARD_CAPACITY: usize = 8192;
 // SHARDS must be a power of two for the bitmask to work correctly.
 const _: () = assert!(SHARDS.is_power_of_two());
 
+// ─── Expiry contract and clock (test-only override) ─────────────────────
+//
+// CONTRACT A — strict read-time TTL filtering.
+//
+// An entry is *logically absent* once `now >= expires_at` (inclusive
+// boundary, millisecond resolution). Every key- or value-returning
+// operation — `get`, `contains`, `del`, `ttl`, `mget`, `scan`, plus
+// `len_active` and `collect_for_snapshot` — samples the current time
+// itself and treats such entries exactly like missing keys, independent
+// of the background sweeper (`sweep_expired` is space reclamation only,
+// never a precondition for expiry).
+//
+// Explicitly outside the contract (physical counts, not logical reads):
+// - `len()` and `is_empty()` count expired-but-unremoved entries.
+// - `scan(prefix, 0, _)` returns early without sampling time or purging.
+// - A store at `max_entries` may reject new keys (`STORE_FULL`) while
+//   expired entries still physically occupy slots, until they are
+//   removed by a read, the sweeper, or a restart-filtered restore.
+//
+// Wall-clock caveat: deadlines are compared against `SystemTime`
+// (required for snapshot portability across restarts), so a system
+// clock rollback can make an expired-but-unremoved entry appear live
+// again. The contract holds relative to the operation's sampled time,
+// not to irreversible real-world elapsed time.
+
+/// The single definition of "expired" for the whole crate (see the
+/// expiry-contract comment above). An entry with `expires_at == Some(exp)`
+/// is expired once `now >= exp` — inclusive at the deadline, millisecond
+/// resolution. `None` means permanent (never expired).
+pub fn is_expired_at(expires_at: Option<u64>, now: u64) -> bool {
+    expires_at.is_some_and(|exp| now >= exp)
+}
+
 fn hash_key(key: &str) -> usize {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut h);
@@ -73,11 +116,81 @@ fn hash_key(key: &str) -> usize {
 ///
 /// Returns 0 if the system clock is before the UNIX epoch (extremely rare,
 /// but avoids a panic in server threads that don't have `catch_unwind`).
+///
+/// # Tests
+///
+/// In the library's own unit tests (`cargo test --lib`), the time source can
+/// be overridden per thread via the `cfg(test)`-only `test_support` module
+/// (`freeze_clock_at`) to make TTL boundary behavior deterministic. The
+/// override is `#[cfg(test)]`-only and never present in production builds,
+/// integration tests, or dependent binaries.
 pub fn now_ms() -> u64 {
+    #[cfg(test)]
+    {
+        // MSRV 1.70: use LocalKey::with, not the LocalKey::set/get
+        // convenience methods (stabilized later, in Rust 1.73).
+        let frozen = test_support::TEST_CLOCK.with(|c| c.get());
+        if let Some(ts) = frozen {
+            return ts;
+        }
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Test-only deterministic clock for this crate's unit tests.
+///
+/// `freeze_clock_at(ts)` installs a thread-local override returned by
+/// [`now_ms`] on the *calling thread only*. The returned guard restores the
+/// previous override (default: none) on drop, including during unwinding.
+/// Correct nesting requires LIFO guard destruction: dropping an outer
+/// guard while an inner one is still alive can install a stale override —
+/// `#[must_use]` plus the conventional `let _g = ...` binding prevents the
+/// worst case (immediate destruction, which would un-freeze at once).
+/// Spawned threads never inherit the override — frozen-clock tests must
+/// stay single-threaded.
+///
+/// `Option<u64>` is used (rather than treating 0 as "unset") so that an
+/// override at timestamp 0 remains representable.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(crate) static TEST_CLOCK: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// RAII guard: restores the previous clock override when dropped
+    /// (including on panic). The override is a property of the thread that
+    /// installed it, and `PhantomData<*const ()>` makes the guard `!Send`:
+    /// if it could be moved, dropping it on another thread would corrupt
+    /// that thread's override while leaving the original thread frozen.
+    #[must_use]
+    pub(crate) struct ClockGuard {
+        prev: Option<u64>,
+        _not_send: std::marker::PhantomData<*const ()>,
+    }
+
+    impl Drop for ClockGuard {
+        fn drop(&mut self) {
+            TEST_CLOCK.with(|c| c.set(self.prev));
+        }
+    }
+
+    /// Freeze this thread's `now_ms()` to `ts`.
+    pub(crate) fn freeze_clock_at(ts: u64) -> ClockGuard {
+        ClockGuard {
+            prev: TEST_CLOCK.with(|c| c.replace(Some(ts))),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    /// Read the current override (test assertions only).
+    pub(crate) fn frozen_now() -> Option<u64> {
+        TEST_CLOCK.with(|c| c.get())
+    }
 }
 
 /// A stored entry: a value with an optional expiry timestamp.
@@ -109,9 +222,12 @@ impl Entry {
         }
     }
 
-    /// Returns true if this entry has expired as of `now`.
+    /// Returns true if this entry has expired as of `now` — the single
+    /// shared expiry predicate (see [`is_expired_at`]; contract comment at
+    /// the top of this file). Inclusive: at `now == expires_at` the entry
+    /// is expired. Millisecond resolution.
     pub fn is_expired(&self, now: u64) -> bool {
-        self.expires_at.is_some_and(|exp| now >= exp)
+        is_expired_at(self.expires_at, now)
     }
 }
 
@@ -219,6 +335,9 @@ impl ShardedKV {
 
     /// Retrieve the value for a key. Returns `None` if the key doesn't exist
     /// or has expired (expired entries are removed on access).
+    ///
+    /// Contract A: an entry whose deadline has elapsed at this call's sampled
+    /// time is never returned, regardless of sweep timing.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         let now = now_ms();
         let shard = self.shard(key);
@@ -343,6 +462,9 @@ impl ShardedKV {
 
     /// Delete a key. Returns the removed value, or `None` if the key didn't exist
     /// or had expired (expired entries are removed on access).
+    ///
+    /// Contract A: an entry whose deadline has elapsed at this call's sampled
+    /// time is treated as already absent — DEL returns `None`, never a value.
     pub fn del(&self, key: &str) -> Option<Vec<u8>> {
         let now = now_ms();
         let shard = self.shard(key);
@@ -368,6 +490,10 @@ impl ShardedKV {
     /// Returns `Some(TtlInfo::Permanent)` for keys with no TTL, or
     /// `Some(TtlInfo::RemainingMs(ms))` for keys with a TTL, where `ms` is the
     /// remaining milliseconds until expiry.
+    ///
+    /// Contract A: an entry whose deadline has elapsed at this call's sampled
+    /// time returns `None`, regardless of sweep timing. Because expiry is
+    /// inclusive (`now >= expires_at`), `RemainingMs(0)` is unreachable.
     pub fn ttl(&self, key: &str) -> Option<TtlInfo> {
         let now = now_ms();
         let shard = self.shard(key);
@@ -401,6 +527,9 @@ impl ShardedKV {
 
     /// Check if a key exists without retrieving its value.
     /// Expired entries are treated as absent and removed on access.
+    ///
+    /// Contract A: an entry whose deadline has elapsed at this call's sampled
+    /// time is never reported as existing, regardless of sweep timing.
     pub fn contains(&self, key: &str) -> bool {
         let now = now_ms();
         let shard = self.shard(key);
@@ -468,6 +597,11 @@ impl ShardedKV {
     }
 
     /// Scan for keys matching a prefix, up to `limit`, starting after `cursor`.
+    ///
+    /// Contract A: an entry whose deadline has elapsed at this call's sampled
+    /// time is never included in the result (or the `more` page count),
+    /// regardless of sweep timing. Exception: `limit == 0` returns early
+    /// without sampling time or inspecting entries.
     ///
     /// Returns matching keys (not values) in lexicographic order, plus a
     /// `more` flag indicating whether additional pages exist.
@@ -542,6 +676,11 @@ impl ShardedKV {
     }
 
     /// Batch retrieve values for multiple keys, preserving request order.
+    ///
+    /// Contract A: for each requested key whose deadline has elapsed at this
+    /// call's sampled time, the result slot is `None`, regardless of sweep
+    /// timing. (Batch reads are not a transactional snapshot — each key's
+    /// filtering uses the single `now` sampled at call start.)
     ///
     /// Returns `Some(value)` for found (non-expired) keys, `None` for missing
     /// or expired keys. Expired keys encountered during MGET are removed
@@ -648,7 +787,7 @@ impl ShardedKV {
     /// It includes expired-but-not-yet-removed entries, and may briefly
     /// include reserved-but-not-yet-inserted entries. Expired entries are
     /// removed (and the count decremented) when accessed via
-    /// `get`/`contains`/`del`/`scan`/`ttl` or when the sweeper runs.
+    /// `get`/`contains`/`del`/`mget`/`scan`/`ttl` or when the sweeper runs.
     /// See also [`len_active`](Self::len_active) for the logical non-expired count.
     pub fn len(&self) -> u64 {
         self.entry_count.load(Ordering::Relaxed)
@@ -1539,5 +1678,399 @@ mod tests {
         thread::sleep(Duration::from_millis(80));
         assert_eq!(store.del("temp"), None);
         assert_eq!(store.len(), 0);
+    }
+
+    // ─── Deterministic TTL contract tests (Contract A) ──────────────────
+    //
+    // All tests in this section use the test-only frozen clock
+    // (`test_support::freeze_clock_at`) — no sleeping, no sweeper thread
+    // (none exists in lib tests), fully deterministic boundaries.
+    //
+    // ANTI-VACUOUS RULE: every assertion uses a freshly planted entry
+    // (via `load_entry`, which bypasses expiry filtering) with physical
+    // presence (`len()`) asserted BEFORE the read, so each read method is
+    // tested against its own physically-present expired entry, not an
+    // already-purged key.
+
+    mod contract {
+        use super::super::test_support::{freeze_clock_at, frozen_now};
+        use super::*;
+        use crate::{is_expired_at, Entry, TtlInfo};
+
+        const T0: u64 = 1_000_000; // arbitrary frozen "now"
+        const DEADLINE: u64 = T0 + 10_000; // entry deadline under test
+
+        /// Plant an entry directly, bypassing expiry filtering, then assert
+        /// the expected total physical count. This guarantees the subsequent
+        /// read is testing expiry *filtering*, not an ordinary missing key.
+        fn plant(store: &ShardedKV, key: &str, expires_at: Option<u64>) {
+            let before = store.len();
+            store.load_entry(key.to_string(), b"v".to_vec(), expires_at);
+            assert_eq!(
+                store.len(),
+                before + 1,
+                "{key} must be physically present pre-read"
+            );
+        }
+
+        // ── Clock guard mechanics ─────────────────────────────────────
+
+        #[test]
+        fn clock_override_represents_timestamp_zero() {
+            // Option<u64> means an override at timestamp 0 is representable
+            // (0 is not treated as "unset").
+            let _g = freeze_clock_at(0);
+            assert_eq!(frozen_now(), Some(0));
+            assert_eq!(now_ms(), 0);
+        }
+
+        #[test]
+        fn clock_guard_restores_previous_state() {
+            let _g1 = freeze_clock_at(111);
+            assert_eq!(frozen_now(), Some(111));
+            {
+                let _g2 = freeze_clock_at(222);
+                assert_eq!(frozen_now(), Some(222));
+            }
+            // Nested guard restored the outer override.
+            assert_eq!(frozen_now(), Some(111));
+        }
+
+        #[test]
+        fn clock_override_affects_now_ms() {
+            let _g = freeze_clock_at(123_456);
+            assert_eq!(now_ms(), 123_456);
+        }
+
+        #[test]
+        fn spawned_threads_do_not_inherit_frozen_clock() {
+            let _g = freeze_clock_at(123_456);
+            let child = thread::spawn(now_ms);
+            let child_now = child.join().unwrap();
+            // The child must see the REAL clock: far from our frozen value,
+            // and (on any machine running these tests) strictly positive.
+            assert_ne!(child_now, 123_456);
+            assert!(child_now > 1_000_000_000_000);
+        }
+
+        // ── Boundary triple: deadline-1 / deadline / deadline+1 ───────
+
+        #[test]
+        fn boundary_get_live_before_deadline() {
+            let _g = freeze_clock_at(T0);
+            let store = ShardedKV::new();
+            store.set_with_ttl("k", b"v".to_vec(), DEADLINE - T0); // deadline DEADLINE
+            let _g2 = freeze_clock_at(DEADLINE - 1);
+            assert_eq!(store.get("k"), Some(b"v".to_vec()));
+        }
+
+        #[test]
+        fn boundary_get_expired_exactly_at_deadline() {
+            let _g = freeze_clock_at(DEADLINE);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            assert_eq!(store.get("k"), None);
+        }
+
+        #[test]
+        fn boundary_get_expired_after_deadline() {
+            let _g = freeze_clock_at(DEADLINE + 1);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            assert_eq!(store.get("k"), None);
+        }
+
+        #[test]
+        fn boundary_contains_live_before_deadline() {
+            let _g = freeze_clock_at(DEADLINE - 1);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            assert!(store.contains("k"));
+        }
+
+        #[test]
+        fn boundary_contains_expired_exactly_at_deadline() {
+            let _g = freeze_clock_at(DEADLINE);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            assert!(!store.contains("k"));
+        }
+
+        #[test]
+        fn boundary_contains_expired_after_deadline() {
+            let _g = freeze_clock_at(DEADLINE + 1);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            assert!(!store.contains("k"));
+        }
+
+        #[test]
+        fn boundary_del_returns_value_live_before_deadline() {
+            let _g = freeze_clock_at(DEADLINE - 1);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            assert_eq!(store.del("k"), Some(b"v".to_vec()));
+        }
+
+        #[test]
+        fn boundary_del_none_exactly_at_deadline() {
+            let _g = freeze_clock_at(DEADLINE);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            assert_eq!(store.del("k"), None);
+        }
+
+        #[test]
+        fn boundary_ttl_remaining_one_before_deadline() {
+            // Most precise boundary proof: at deadline-1 the entry reports
+            // exactly 1ms remaining; RemainingMs(0) is unreachable because
+            // at the deadline the key is already absent.
+            let _g = freeze_clock_at(DEADLINE - 1);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            assert_eq!(store.ttl("k"), Some(TtlInfo::RemainingMs(1)));
+        }
+
+        #[test]
+        fn boundary_ttl_none_exactly_at_deadline() {
+            let _g = freeze_clock_at(DEADLINE);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            assert_eq!(store.ttl("k"), None);
+        }
+
+        #[test]
+        fn boundary_mget_live_before_deadline() {
+            let _g = freeze_clock_at(DEADLINE - 1);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            let r = store.mget(&["k".to_string()]);
+            assert_eq!(r[0], Some(b"v".to_vec()));
+        }
+
+        #[test]
+        fn boundary_mget_not_found_exactly_at_deadline() {
+            let _g = freeze_clock_at(DEADLINE);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            let r = store.mget(&["k".to_string()]);
+            assert_eq!(r[0], None);
+        }
+
+        #[test]
+        fn boundary_mget_not_found_after_deadline() {
+            let _g = freeze_clock_at(DEADLINE + 1);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            let r = store.mget(&["k".to_string()]);
+            assert_eq!(r[0], None);
+        }
+
+        #[test]
+        fn boundary_scan_includes_live_before_deadline() {
+            let _g = freeze_clock_at(DEADLINE - 1);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            let (keys, more) = store.scan("", 100, "");
+            assert_eq!(keys, vec!["k"]);
+            assert!(!more);
+        }
+
+        #[test]
+        fn boundary_scan_omits_expired_exactly_at_deadline() {
+            let _g = freeze_clock_at(DEADLINE);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            let (keys, more) = store.scan("", 100, "");
+            assert!(keys.is_empty());
+            assert!(!more);
+        }
+
+        #[test]
+        fn boundary_scan_omits_expired_after_deadline() {
+            let _g = freeze_clock_at(DEADLINE + 1);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE));
+            let (keys, _) = store.scan("", 100, "");
+            assert!(keys.is_empty());
+        }
+
+        #[test]
+        fn scan_pagination_with_expired_entries_interspersed() {
+            // Pages of 2 over a..e where c is expired: pagination must skip
+            // "c" and the `more` flag must reflect the LIVE key count only.
+            let _g = freeze_clock_at(DEADLINE);
+            let store = ShardedKV::new();
+            plant(&store, "a", None);
+            plant(&store, "b", Some(DEADLINE + 60_000));
+            plant(&store, "c", Some(DEADLINE)); // expired at sampled now
+            plant(&store, "d", None);
+            plant(&store, "e", None);
+
+            let (page1, more) = store.scan("", 2, "");
+            assert_eq!(page1, vec!["a", "b"]);
+            assert!(more);
+            let (page2, more) = store.scan("", 2, "b");
+            assert_eq!(page2, vec!["d", "e"]); // "c" skipped
+            assert!(!more);
+        }
+
+        #[test]
+        fn boundary_len_active_includes_live_excludes_expired() {
+            let _g = freeze_clock_at(DEADLINE);
+            let store = ShardedKV::new();
+            plant(&store, "dead", Some(DEADLINE));
+            plant(&store, "perm", None);
+            assert_eq!(store.len(), 2); // physical: expired entry still there
+            assert_eq!(store.len_active(), 1); // logical: only "perm"
+        }
+
+        #[test]
+        fn boundary_snapshot_excludes_expired_preserves_live_deadline() {
+            let _g = freeze_clock_at(DEADLINE);
+            let store = ShardedKV::new();
+            plant(&store, "dead", Some(DEADLINE));
+            plant(&store, "live", Some(DEADLINE + 60_000));
+            let snap = store.collect_for_snapshot();
+            // No purge: both entries remain physically present.
+            assert_eq!(store.len(), 2);
+            assert_eq!(snap.len(), 1);
+            assert_eq!(snap[0].0, "live");
+            // Absolute deadline survives, unmodified.
+            assert_eq!(snap[0].2, Some(DEADLINE + 60_000));
+        }
+
+        // ── Non-expiring and live-TTL keys unchanged ───────────────────
+
+        #[test]
+        fn permanent_entry_behaves_identically_with_frozen_clock() {
+            let _g = freeze_clock_at(T0);
+            let store = ShardedKV::new();
+            store.set("perm", b"v".to_vec());
+            assert_eq!(store.get("perm"), Some(b"v".to_vec()));
+            assert!(store.contains("perm"));
+            assert_eq!(store.ttl("perm"), Some(TtlInfo::Permanent));
+            let (keys, _) = store.scan("", 100, "");
+            assert_eq!(keys, vec!["perm"]);
+        }
+
+        // ── Overwrite / TTL-refresh semantics ──────────────────────────
+
+        #[test]
+        fn setx_overwrite_recomputes_deadline_from_overwrite_time() {
+            let store = ShardedKV::new();
+            let _g = freeze_clock_at(T0);
+            assert!(store.set_with_ttl("k", b"v1".to_vec(), 5_000)); // deadline T0+5000
+            let _g2 = freeze_clock_at(T0 + 4_000);
+            assert!(store.set_with_ttl("k", b"v2".to_vec(), 5_000)); // new deadline T0+9000
+                                                                     // Old deadline passed, new one not yet.
+            let _g3 = freeze_clock_at(T0 + 6_000);
+            assert_eq!(store.get("k"), Some(b"v2".to_vec()));
+            match store.ttl("k") {
+                Some(TtlInfo::RemainingMs(ms)) => assert_eq!(ms, 3_000),
+                other => panic!("expected RemainingMs, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn setx_revives_expired_but_unremoved_entry_no_count_change() {
+            // Overwriting an expired-but-physically-present key takes the
+            // Occupied branch: value and deadline replaced, count unchanged.
+            let _g = freeze_clock_at(DEADLINE);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE)); // expired at frozen now
+            let _g2 = freeze_clock_at(DEADLINE + 100);
+            assert!(store.set_with_ttl("k", b"v2".to_vec(), 5_000));
+            assert_eq!(store.len(), 1); // revived in place, no new entry
+            assert_eq!(store.get("k"), Some(b"v2".to_vec()));
+        }
+
+        #[test]
+        fn set_clears_ttl_entry_survives_old_deadline() {
+            let _g = freeze_clock_at(T0);
+            let store = ShardedKV::new();
+            assert!(store.set_with_ttl("k", b"v1".to_vec(), 5_000)); // deadline T0+5000
+            let _g2 = freeze_clock_at(T0 + 2_000);
+            assert!(store.set("k", b"v2".to_vec())); // clears TTL
+            let _g3 = freeze_clock_at(T0 + 10_000); // past the old deadline
+            assert_eq!(store.get("k"), Some(b"v2".to_vec()));
+            assert_eq!(store.ttl("k"), Some(TtlInfo::Permanent));
+        }
+
+        #[test]
+        fn setx_zero_ttl_rejected_without_mutating_existing_entry() {
+            let _g = freeze_clock_at(T0);
+            let store = ShardedKV::new();
+            assert!(store.set_with_ttl("k", b"v1".to_vec(), 5_000));
+            let _g2 = freeze_clock_at(T0 + 1_000);
+            // Zero TTL rejected even on overwrite — existing entry untouched.
+            assert!(!store.set_with_ttl("k", b"v2".to_vec(), 0));
+            assert_eq!(store.len(), 1);
+            assert_eq!(store.get("k"), Some(b"v1".to_vec()));
+            match store.ttl("k") {
+                Some(TtlInfo::RemainingMs(ms)) => assert_eq!(ms, 4_000), // deadline unchanged
+                other => panic!("expected RemainingMs, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn setx_max_ttl_saturates_lives_to_end_of_representable_time() {
+            let _g = freeze_clock_at(T0);
+            let store = ShardedKV::new();
+            assert!(store.set_with_ttl("k", b"v".to_vec(), u64::MAX));
+            // expires_at saturates to u64::MAX; the entry lives at every
+            // representable time below that, and expires AT it (inclusive).
+            let _g2 = freeze_clock_at(u64::MAX - 1);
+            assert_eq!(store.get("k"), Some(b"v".to_vec()));
+            let _g3 = freeze_clock_at(u64::MAX);
+            assert_eq!(store.get("k"), None);
+        }
+
+        // ── Sweep independence (Contract A with sweeper disabled) ──────
+        //
+        // No sweeper thread exists in these tests — but the point is the
+        // reads filter on their own sampled time even when NOTHING ever
+        // sweeps. Physical removal happens lazily as a side effect.
+
+        #[test]
+        fn expired_entry_never_served_with_sweeper_never_run() {
+            let _g = freeze_clock_at(DEADLINE);
+            let store = ShardedKV::new();
+            plant(&store, "k", Some(DEADLINE)); // expired, never swept
+            assert_eq!(store.get("k"), None);
+            assert_eq!(store.len(), 0); // lazily removed as side effect
+        }
+
+        // ── Shared predicate sanity ────────────────────────────────────
+
+        #[test]
+        fn is_expired_at_shared_predicate_boundaries() {
+            assert!(!is_expired_at(None, u64::MAX)); // permanent never expires
+            assert!(!is_expired_at(Some(100), 99)); // strictly before
+            assert!(is_expired_at(Some(100), 100)); // exactly at (inclusive)
+            assert!(is_expired_at(Some(100), 101)); // after
+            assert!(!Entry::new(vec![]).is_expired(u64::MAX));
+            assert!(Entry::with_expiry(vec![], 100).is_expired(100));
+        }
+
+        // ── Capacity occupied by expired-but-unswept entries ───────────
+
+        #[test]
+        fn expired_entries_hold_capacity_until_removed() {
+            // With no sweep ever running, expired entries still occupy
+            // capacity slots — documented contract exclusion, tested here
+            // with the frozen clock (no sleeps).
+            let _g = freeze_clock_at(T0);
+            let store = ShardedKV::with_max_entries(1);
+            assert!(store.set_with_ttl("k", b"v".to_vec(), 5_000));
+            // Expire it, no sweep, no read.
+            let _g2 = freeze_clock_at(T0 + 10_000);
+            assert!(!store.set("new", b"v".to_vec())); // STORE_FULL: slot still held
+            assert_eq!(store.len(), 1);
+            // A read frees the slot (lazy removal).
+            assert_eq!(store.get("k"), None);
+            assert!(store.set("new", b"v".to_vec())); // capacity reclaimed
+            assert_eq!(store.len(), 1);
+        }
     }
 }

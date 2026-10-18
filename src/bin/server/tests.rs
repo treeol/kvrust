@@ -2048,4 +2048,295 @@ mod snapshot_tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    // ─── TTL contract tests (deterministic, no sleeps, no sweeper) ──────
+
+    /// Gated `#[cfg(unix)]` to match `restore_snapshot_at` (it exists only
+    /// for the unix-gated `main()`). The wire-level proof tests are gated
+    /// along with it — they still run on every unix CI target.
+    #[cfg(unix)]
+    mod contract_tests {
+        use super::*;
+
+        const LIVE_DEADLINE: u64 = u64::MAX / 2; // comfortably in the future for any real clock
+
+        /// Plant an entry with an arbitrary absolute deadline, bypassing
+        /// expiry filtering (load_entry). Assert physical presence first so
+        /// the subsequent read tests filtering, not absence.
+        fn plant_expired(store: &ShardedKV) {
+            // Deadline 1 — expired at any real "now" (1 means 1970-01-01
+            // + 1ms; the wire format reserves 0 for "permanent").
+            store.load_entry("dead".to_string(), b"stale".to_vec(), Some(1));
+            assert_eq!(store.len(), 1, "expired entry must be physically present");
+        }
+
+        // ── Proof 2: wire-level Contract A with a physically present ──
+        // ── expired entry, no sweeper running. Fresh store per command ──
+        // (the first read purges; sharing would make later tests vacuous).
+
+        #[test]
+        fn wire_get_never_serves_expired_entry() {
+            let store = ShardedKV::new();
+            plant_expired(&store);
+            assert_eq!(
+                dispatch(&make_get("dead"), &store, None),
+                vec![RESP_NOT_FOUND]
+            );
+        }
+
+        #[test]
+        fn wire_exists_never_reports_expired_entry() {
+            let store = ShardedKV::new();
+            plant_expired(&store);
+            assert_eq!(
+                dispatch(&make_exists("dead"), &store, None),
+                vec![RESP_NOT_FOUND]
+            );
+        }
+
+        #[test]
+        fn wire_del_treats_expired_entry_as_absent() {
+            let store = ShardedKV::new();
+            plant_expired(&store);
+            // DEL on an expired-but-present entry: the value must NOT be
+            // returned to the client; the entry is removed and the response
+            // is NOT_FOUND.
+            assert_eq!(
+                dispatch(&make_del("dead"), &store, None),
+                vec![RESP_NOT_FOUND]
+            );
+            assert_eq!(store.len(), 0);
+        }
+
+        #[test]
+        fn wire_scan_omits_expired_entry() {
+            // Expired-only store: scan returns zero keys.
+            let store = ShardedKV::new();
+            plant_expired(&store);
+            let resp = dispatch(&make_scan("", 100, ""), &store, None);
+            assert_eq!(resp[0], RESP_OK);
+            let count = u16::from_be_bytes([resp[1], resp[2]]) as usize;
+            assert_eq!(count, 0); // "dead" omitted
+            assert_eq!(resp[resp.len() - 1], 0x00); // more = false
+        }
+
+        #[test]
+        fn wire_scan_omits_expired_keeps_live() {
+            let store = ShardedKV::new();
+            plant_expired(&store);
+            store.set("perm", b"live".to_vec());
+            let resp = dispatch(&make_scan("", 100, ""), &store, None);
+            assert_eq!(resp[0], RESP_OK);
+            let count = u16::from_be_bytes([resp[1], resp[2]]) as usize;
+            assert_eq!(count, 1); // only "perm"
+            let kl = u16::from_be_bytes([resp[3], resp[4]]) as usize;
+            assert_eq!(&resp[5..5 + kl], b"perm");
+        }
+
+        #[test]
+        fn wire_mget_flags_expired_entry_as_not_found() {
+            let store = ShardedKV::new();
+            plant_expired(&store);
+            store.set("perm", b"live".to_vec());
+            let resp = dispatch(&make_mget(&["dead", "perm"]), &store, None);
+            assert_eq!(resp[0], RESP_OK);
+            assert_eq!(resp[1], 0x00); // "dead" → not-found flag
+        }
+
+        #[test]
+        fn wire_ttl_not_found_for_expired_entry() {
+            let store = ShardedKV::new();
+            plant_expired(&store);
+            assert_eq!(
+                dispatch(&make_ttl("dead"), &store, None),
+                vec![RESP_NOT_FOUND]
+            );
+        }
+
+        // ── Proof 3a: restart filtering — hand-crafted KVR1 snapshot ───
+        // (normal save filters expired entries at write time, so the dead
+        // record must be crafted into the file directly). Parser-first:
+        // verify load() returns both records before any restore.
+
+        /// Minimal test-local KVR1 encoder (magic + count + entries + CRC).
+        fn encode_snapshot(entries: &[(String, Vec<u8>, Option<u64>)]) -> Vec<u8> {
+            let mut buf = SNAPSHOT_MAGIC.to_vec();
+            buf.extend_from_slice(&(entries.len() as u64).to_be_bytes());
+            for (key, value, expires_at) in entries {
+                buf.extend_from_slice(&(key.len() as u16).to_be_bytes());
+                buf.extend_from_slice(key.as_bytes());
+                buf.extend_from_slice(&(value.len() as u32).to_be_bytes());
+                buf.extend_from_slice(value);
+                buf.extend_from_slice(&expires_at.unwrap_or(0).to_be_bytes());
+            }
+            let crc = crc32(&buf[SNAPSHOT_MAGIC.len()..]);
+            buf.extend_from_slice(&crc.to_be_bytes());
+            buf
+        }
+
+        #[test]
+        fn restart_filter_skips_expired_deadline_exact_boundary_and_boundary_minus_one() {
+            // Craft: dead (expires 1), boundary (expires == restore ts),
+            // live (far future), permanent (expires_at None → 0).
+            let restore_ts: u64 = 1_700_000_000_000; // 2023-11-14T22:13:20Z
+            let entries = vec![
+                ("dead".to_string(), b"stale".to_vec(), Some(1)),
+                (
+                    "boundary".to_string(),
+                    b"at-deadline".to_vec(),
+                    Some(restore_ts),
+                ),
+                ("live".to_string(), b"fresh".to_vec(), Some(LIVE_DEADLINE)),
+                ("perm".to_string(), b"forever".to_vec(), None),
+            ];
+            let path = temp_snapshot_path();
+            std::fs::write(&path, encode_snapshot(&entries)).expect("write snapshot");
+
+            // Parser first: load() returns all 4 records, deadlines unchanged.
+            let loaded_records = SnapshotManager::load(std::path::Path::new(&path)).expect("load");
+            assert_eq!(loaded_records.len(), 4);
+            assert_eq!(loaded_records[0].2, Some(1));
+            assert_eq!(loaded_records[1].2, Some(restore_ts));
+            assert_eq!(loaded_records[2].2, Some(LIVE_DEADLINE));
+            assert_eq!(loaded_records[3].2, None);
+
+            // Restore at the boundary timestamp: entries with deadline
+            // <= restore_ts are skipped ("boundary" is skipped because
+            // expiry is inclusive).
+            let store = ShardedKV::new();
+            let (loaded, skipped) = restore_snapshot_at(&store, loaded_records, restore_ts);
+            // Assertions BEFORE any read — lazy removal must not be able to
+            // mask a broken restore filter.
+            assert_eq!(skipped, 2); // "dead" and "boundary"
+            assert_eq!(loaded, 2);
+            assert_eq!(store.len(), 2); // physical count matches accepted records
+
+            // Then the wire view: only live + permanent are servable.
+            assert_eq!(store.get("dead"), None);
+            assert_eq!(store.get("boundary"), None);
+            assert_eq!(store.get("live"), Some(b"fresh".to_vec()));
+            assert_eq!(store.get("perm"), Some(b"forever".to_vec()));
+
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn restart_filter_deadline_one_ms_after_restore_ts_is_loaded() {
+            // The other side of the inclusive boundary: deadline ==
+            // restore_ts + 1 must be loaded (not skipped). Counts are
+            // asserted only — read-time servability of live entries is
+            // proven separately (the read paths sample the real clock,
+            // which is far past this synthetic restore timestamp).
+            let restore_ts: u64 = 1_700_000_000_000;
+            let entries = vec![("almost".to_string(), b"v".to_vec(), Some(restore_ts + 1))];
+            let path = temp_snapshot_path();
+            std::fs::write(&path, encode_snapshot(&entries)).expect("write snapshot");
+
+            let records = SnapshotManager::load(std::path::Path::new(&path)).expect("load");
+            assert_eq!(records.len(), 1);
+
+            let store = ShardedKV::new();
+            let (loaded, skipped) = restore_snapshot_at(&store, records, restore_ts);
+            assert_eq!((loaded, skipped), (1, 0));
+            assert_eq!(store.len(), 1);
+
+            let _ = std::fs::remove_file(&path);
+        }
+
+        // ── Proof 3b: real-writer variant — no crafted bytes, no sleep ──
+
+        #[test]
+        fn restart_filter_real_save_then_restore_beyond_deadline() {
+            // Save an entry with a far-future deadline using the real
+            // encoder, then restore using an explicit timestamp beyond that
+            // deadline — deterministic "expired during downtime" without
+            // sleeping or crafting bytes.
+            let path = temp_snapshot_path();
+            let store = ShardedKV::new();
+            let deadline = now_ms() + 3_600_000; // 1h out
+            store.load_entry("sleeping".to_string(), b"v".to_vec(), Some(deadline));
+            store.set("perm", b"forever".to_vec());
+
+            let mgr = SnapshotManager::new(std::path::PathBuf::from(&path));
+            mgr.save(&store).expect("save");
+
+            // "Downtime": restore at a time past the deadline.
+            let restore_ts = deadline + 1_000;
+            let records = SnapshotManager::load(std::path::Path::new(&path)).expect("load");
+            let restored = ShardedKV::new();
+            let (loaded, skipped) = restore_snapshot_at(&restored, records, restore_ts);
+            assert_eq!((loaded, skipped), (1, 1)); // only "perm" survives
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored.get("sleeping"), None);
+            assert_eq!(restored.get("perm"), Some(b"forever".to_vec()));
+
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn restart_filter_preserves_deadlines_unmodified() {
+            // A loaded entry keeps its ORIGINAL absolute deadline — the TTL
+            // is never "restarted" at restore time. Uses a far-future
+            // deadline (valid at the real clock) so the stored entry is
+            // observable via collect_for_snapshot after restore.
+            let remaining = 7_777_777u64;
+            let deadline = now_ms() + 1_000_000_000; // ~11.6 days out
+            let restore_ts = deadline - remaining; // restore happens "before" the deadline
+            let entries = vec![("k".to_string(), b"v".to_vec(), Some(deadline))];
+            let path = temp_snapshot_path();
+            std::fs::write(&path, encode_snapshot(&entries)).expect("write snapshot");
+            let records = SnapshotManager::load(std::path::Path::new(&path)).expect("load");
+
+            let store = ShardedKV::new();
+            let (loaded, skipped) = restore_snapshot_at(&store, records, restore_ts);
+            assert_eq!((loaded, skipped), (1, 0));
+
+            // The stored deadline must be exactly the crafted one — restore
+            // must not re-base the absolute deadline.
+            let snap = store.collect_for_snapshot();
+            assert_eq!(snap.len(), 1);
+            assert_eq!(snap[0].0, "k");
+            assert_eq!(
+                snap[0].2,
+                Some(deadline),
+                "restore must not re-base the absolute deadline"
+            );
+
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn restart_filter_expired_duplicate_does_not_erase_accepted_record() {
+            // Duplicate key in the snapshot: first record live, second
+            // record expired. The expired duplicate must be SKIPPED (not
+            // loaded over the live value), and the accepted-record count
+            // must reflect skip-not-overwrite semantics: loaded counts
+            // records, so (1 accepted, 1 skipped) even though both records
+            // share a key.
+            let restore_ts: u64 = 1_700_000_000_000;
+            let entries = vec![
+                ("dup".to_string(), b"good".to_vec(), Some(LIVE_DEADLINE)),
+                ("dup".to_string(), b"stale".to_vec(), Some(1)), // expired at restore
+            ];
+            let path = temp_snapshot_path();
+            std::fs::write(&path, encode_snapshot(&entries)).expect("write snapshot");
+
+            let records = SnapshotManager::load(std::path::Path::new(&path)).expect("load");
+            assert_eq!(records.len(), 2);
+
+            let store = ShardedKV::new();
+            let (loaded, skipped) = restore_snapshot_at(&store, records, restore_ts);
+            assert_eq!((loaded, skipped), (1, 1));
+            assert_eq!(store.len(), 1); // one distinct key
+                                        // The accepted record survives with its original value+deadline
+                                        // (observable at the real clock: LIVE_DEADLINE is far future).
+            let snap = store.collect_for_snapshot();
+            assert_eq!(snap.len(), 1);
+            assert_eq!(snap[0].0, "dup");
+            assert_eq!(snap[0].1, b"good".to_vec());
+            assert_eq!(snap[0].2, Some(LIVE_DEADLINE));
+
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }

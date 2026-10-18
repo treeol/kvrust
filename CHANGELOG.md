@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Explicit **TTL read-time filtering contract** (Contract A), now documented
+  in the library docs, README, and code comments: no key- or value-returning
+  operation ever serves an entry whose absolute expiry deadline (UNIX epoch
+  ms, inclusive at the deadline) is at or before the time sampled by that
+  operation — regardless of sweep timing or sweeper disablement. Snapshot
+  restore applies the same strict filter at the restore timestamp, so a key
+  that expires during downtime is never served after restart.
+- `kvr::is_expired_at(expires_at, now)` — the single shared expiry predicate;
+  `Entry::is_expired` and snapshot restore now both delegate to it.
+- Deterministic TTL tests using a `#[cfg(test)]`-only thread-local clock
+  override (`freeze_clock_at`): boundary triple (before / exactly-at / after
+  the deadline) across every read path, overwrite/refresh semantics
+  (SETX recomputes the deadline, SET clears TTL, zero-TTL rejection is
+  non-mutating, expired-entry revival), sweep-independence, and clock-guard
+  mechanics — no sleeps, no sweeper dependency.
+- `restore_snapshot_at(store, entries, now)` in the server: the restart-time
+  expiry filter is extracted from `main()` and is now directly testable;
+  tests cover expired-during-downtime (skipping keys whose deadline is at or
+  before the sampled restore timestamp), inclusive boundary, deadline
+  preservation, and a hand-crafted KVR1 snapshot fixture with an
+  expired record (hand-crafted because save-time filtering would never
+  write one), plus a real-writer no-sleep variant (save a far-future
+  deadline, restore at a timestamp beyond it).
 - `TTL` protocol command (opcode `0x09`) — query remaining TTL for a key.
   Returns permanent/remaining-ms, or NOT_FOUND for missing/expired keys.
 - `TtlInfo` enum and `ShardedKV::ttl()` library method.

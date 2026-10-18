@@ -37,7 +37,7 @@ Frames are length-prefixed (4-byte big-endian length + payload).
 |------|---------|
 | `0x10` | OK (SET success, GET found, PING, EXISTS found) |
 | `0x11` | DELETED (DEL removed a key) |
-| `0x12` | NOT_FOUND (GET/DEL/EXISTS on missing key) |
+| `0x12` | NOT_FOUND (GET/DEL/EXISTS/TTL on missing or expired key) |
 | `0x13` | STORE_FULL (SET rejected — max entry count reached) |
 | `0xFF` | ERROR (bad frame, unknown opcode, invalid UTF-8, trailing bytes, SETX with ttl=0, MGET response overflow, SAVE failure) |
 
@@ -91,32 +91,63 @@ view), serialize, release locks, write to `<path>.tmp`, fsync, atomic rename to
 existing valid snapshot.
 
 Load on startup: if `KVR_SNAPSHOT_PATH` is set and the file exists, entries are
-loaded, **skipping entries whose `expires_at` is already past**. If the file is
+loaded, **skipping entries whose `expires_at` is at or before the restore
+timestamp**. If the file is
 corrupted (bad magic, truncation, CRC mismatch), the server refuses to load,
 logs the error, and starts empty. Never half-loads.
 
 When a snapshot contains more entries than `KVR_MAX_ENTRIES` (config changed
 between runs, or snapshot taken under 0=unlimited loaded under a bounded config),
-all entries are loaded anyway — never silently drop persisted data. `entry_count`
-reflects the true loaded count, which may exceed `max_entries`. New SETs for
-non-existing keys return `STORE_FULL` until expiry/deletes bring the count under max.
+all non-expired entries are loaded anyway — never silently drop persisted data.
+`entry_count` reflects the true loaded count, which may exceed `max_entries`.
+New SETs for non-existing keys return `STORE_FULL` until expiry/deletes bring
+the count under max.
 
 ### TTL and expiry
 
-SETX (0x05) sets a key-value pair with a relative TTL. The server computes
-`expires_at = now_ms + ttl_ms` (UNIX epoch milliseconds). `ttl_ms` must be > 0;
-a value of 0 returns `0xFF`. Response semantics are identical to SET (`0x10`
+**Contract (strict read-time filtering).** No key- or value-returning command
+ever serves an entry whose expiry deadline has elapsed, regardless of sweep
+timing. GET, EXISTS, DEL, MGET, SCAN, and TTL each sample the server's current
+time themselves and treat an expired entry exactly like a missing key. Expiry
+is **inclusive**: at `now == expires_at` the entry is already expired
+(a GET one millisecond before the deadline still succeeds; a GET at the
+deadline returns NOT_FOUND). All comparisons are at millisecond resolution.
+This guarantee holds even when the sweeper is disabled
+(`KVR_SWEEP_INTERVAL_SECS=0`) — expiry filtering never depends on it.
+
+Exclusions (physical bookkeeping, not logical reads): `len()` and
+`is_empty()` count expired-but-unremoved entries; `scan` with `limit == 0`
+returns early without sampling time or inspecting entries; and a store at
+`KVR_MAX_ENTRIES` may return `STORE_FULL` while expired entries still occupy
+slots, until a read, the sweeper, or a restart removes them.
+
+On restart, snapshot restore applies the same strict filter at the restore
+timestamp: a key whose deadline is at or before the sampled restore timestamp
+is **never inserted**, so it cannot be served after restart. Loaded entries
+keep their original absolute deadlines — a TTL is never "restarted".
+(Direct-`dispatch` tests prove the payload-level filtering; they do not
+exercise socket framing or a real process restart.)
+
+SETX (0x05) sets a key-value pair with a relative TTL (duration). The server
+computes and stores an absolute deadline `expires_at = now_ms + ttl_ms`
+(saturating addition; UNIX epoch milliseconds); the relative duration is
+never stored. `ttl_ms` must be > 0; a value of 0 returns `0xFF` and — even on
+overwrite — leaves any existing entry untouched (value, deadline, and count
+all unchanged). Response semantics are identical to SET (`0x10`
 or `0x13` STORE_FULL).
 
 Plain SET (0x00) creates a permanent entry (no TTL) and **overwrites any
 existing TTL** on that key — the entry becomes permanent.
 
-Expired entries are handled two ways:
+Expired entries are physically removed two ways (space reclamation only —
+never a precondition for the filtering above):
 
 - **Lazy**: GET, EXISTS, DEL, MGET, SCAN, and TTL treat an expired entry as
-  absent (NOT_FOUND). The entry is removed at that moment with an entry-count
+  absent (SCAN omits it; MGET returns a per-item not-found flag; the others
+  respond NOT_FOUND). The entry is removed at that moment with an entry-count
   decrement, freeing capacity. SCAN additionally purges all expired entries it
   encounters during shard iteration, not just those matching the prefix/cursor.
+  `scan` with `limit == 0` returns early and purges nothing.
 - **Active**: a background sweeper thread makes a full pass over all 16 shards
   every `KVR_SWEEP_INTERVAL_SECS` seconds (default 30, 0 = disabled). Per-shard
   write locks are held only per shard, never globally. The sweeper is O(n) — it
@@ -125,7 +156,10 @@ Expired entries are handled two ways:
 
 TTL timestamps use `SystemTime` (wall clock) rather than a monotonic clock.
 This is intentional: expiry timestamps must be comparable to real-world time
-for snapshot portability across restarts.
+for snapshot portability across restarts. Consequence: a system clock rollback
+can make an expired-but-unremoved entry appear live again; the contract holds
+relative to each operation's sampled time, not to irreversible real-world
+elapsed time.
 
 ### Limits
 
@@ -318,8 +352,8 @@ The container runs as a non-root user (`kvr`), with the socket directory at `/ru
 
 ## Tests
 
-- **55 library tests** — basic CRUD, empty values, large values, concurrent access, memory bounds, entry counting, TTL (lazy expiry, sweeper, SET-after-SETX, capacity freed, concurrent races, ttl command), SCAN (basic, pagination, prefix, expired exclusion, expired purge, capacity freed, limit-zero), MGET (mixed, ordering, expired exclusion), snapshot (collect_for_snapshot, load_entry), len_active
-- **99 server tests** — protocol unit tests (all 10 opcodes, error conditions, trailing bytes, invalid UTF-8, SETX/SCAN/MGET/SAVE/TTL edge cases), sweeper tests, snapshot tests (save/load roundtrip, expired-at-save filtered, corrupted file, bad magic, truncated file, .tmp-crash, concurrent save, over-capacity load, SAVE dispatch, file permissions), TCP wire tests, UDS wire tests (roundtrip, large value, errors, SETX, SCAN pagination/prefix, MGET mixed/overflow, TTL roundtrip)
+- **~86 library tests** — basic CRUD, empty values, large values, concurrent access, memory bounds, entry counting, TTL (lazy expiry, sweeper, SET-after-SETX, capacity freed, concurrent races, ttl command, deterministic boundary/overwrite/clock-override contract tests), SCAN (basic, pagination, prefix, expired exclusion, expired purge, capacity freed, limit-zero, interspersed-expired pagination), MGET (mixed, ordering, expired exclusion), snapshot (collect_for_snapshot, load_entry), len_active
+- **~110 server tests** — protocol unit tests (all 10 opcodes, error conditions, trailing bytes, invalid UTF-8, SETX/SCAN/MGET/SAVE/TTL edge cases), sweeper tests, snapshot tests (save/load roundtrip, expired-at-save filtered, corrupted file, bad magic, truncated file, .tmp-crash, concurrent save, over-capacity load, SAVE dispatch, file permissions, restart-expiry filtering with hand-crafted and real-writer snapshots), TCP wire tests, UDS wire tests (roundtrip, large value, errors, SETX, SCAN pagination/prefix, MGET mixed/overflow, TTL roundtrip), TTL contract tests (wire-level: expired-but-present entries never served by GET/EXISTS/DEL/SCAN/MGET/TTL with no sweeper)
 - **2 doctests** — crate-level usage example and ShardedKV usage example (set, get, set_with_ttl)
 
 ## Versioning

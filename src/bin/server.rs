@@ -387,10 +387,13 @@ impl SnapshotManager {
 
     /// Save a snapshot of the store to disk.
     ///
-    /// Acquires read locks on ALL shards simultaneously for a point-in-time view,
-    /// serializes, releases locks, then writes to `<path>.tmp`, fsyncs, atomically
-    /// renames to `<path>`, and fsyncs the parent directory. A crash mid-save
-    /// never corrupts or removes an existing valid snapshot.
+    /// Entries are collected under read locks on ALL shards simultaneously
+    /// (a point-in-time view, with expired entries excluded); the locks are
+    /// released as soon as collection returns, and serialization and file
+    /// I/O happen outside any shard lock. The result is written to
+    /// `<path>.tmp`, fsynced, atomically renamed to `<path>`, and the parent
+    /// directory is fsynced. A crash mid-save never corrupts or removes an
+    /// existing valid snapshot.
     pub fn save_snapshot(&self, store: &ShardedKV) -> std::io::Result<()> {
         let _lock = self.save_lock.lock();
 
@@ -749,6 +752,38 @@ fn ping_client(socket_path: &str) -> ! {
     std::process::exit(exit_code);
 }
 
+/// Restore snapshot entries into a store, skipping entries that are expired
+/// **at the supplied restore timestamp** (inclusive: `now >= expires_at`).
+/// This is the restart/downtime half of the TTL contract: a key whose
+/// deadline is at or before the sampled restore timestamp is never inserted,
+/// so no read path can serve it after restart — even if the sweeper is
+/// disabled.
+///
+/// Deadlines are restored unchanged (absolute, never "restarted").
+/// Over-capacity behavior is preserved: `load_entry` bypasses the
+/// max-entries CAS by design (a snapshot taken under a larger bound must
+/// still load). Duplicates overwrite in iteration order, but only among
+/// accepted (non-expired) records — an expired later duplicate is skipped
+/// and does not erase an earlier accepted record for the same key.
+///
+/// `loaded` counts accepted *records*, not necessarily distinct keys.
+#[cfg(unix)]
+fn restore_snapshot_at(store: &ShardedKV, entries: Vec<SnapshotEntry>, now: u64) -> (usize, usize) {
+    let mut loaded = 0;
+    let mut skipped = 0;
+    for (key, value, expires_at) in entries {
+        // Skip entries expired at (or before) the restore timestamp.
+        // Uses the crate-wide shared expiry predicate (Contract A).
+        if kvr::is_expired_at(expires_at, now) {
+            skipped += 1;
+            continue;
+        }
+        store.load_entry(key, value, expires_at);
+        loaded += 1;
+    }
+    (loaded, skipped)
+}
+
 // ─── Configuration ────────────────────────────────────────────────────
 
 /// Server configuration parsed from `KVR_*` environment variables.
@@ -859,25 +894,15 @@ fn main() {
     });
 
     // Load snapshot on startup if path is configured and file exists.
+    // Startup applies strict filtering: a key whose deadline elapsed before
+    // or during downtime is never inserted, so it can never be served after
+    // restart (see `restore_snapshot_at` — Contract A, restart half).
     if let Some(ref path_str) = snapshot_path {
         let path = std::path::PathBuf::from(path_str);
         if path.exists() {
             match SnapshotManager::load(&path) {
                 Ok(entries) => {
-                    let now = now_ms();
-                    let mut loaded = 0;
-                    let mut skipped = 0;
-                    for (key, value, expires_at) in entries {
-                        // Skip entries that are already expired.
-                        if let Some(exp) = expires_at {
-                            if now >= exp {
-                                skipped += 1;
-                                continue;
-                            }
-                        }
-                        store.load_entry(key, value, expires_at);
-                        loaded += 1;
-                    }
+                    let (loaded, skipped) = restore_snapshot_at(&store, entries, now_ms());
                     eprintln!("snapshot: loaded {loaded} entries from {path_str} (skipped {skipped} expired)");
                 }
                 Err(e) => {
